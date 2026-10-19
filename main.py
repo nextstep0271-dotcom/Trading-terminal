@@ -56,41 +56,37 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
     exchange = exchange_class(config)
     base_asset, quote_asset = symbol.split('/') if '/' in symbol else ('BTC', 'USDT')
 
-    pair_balances = {quote_asset: 0.0, base_asset: 0.0}
-
     while True:
         try:
-            # ดึง Order Book 5 ชั้นราคา
-            orderbook = await exchange.watch_order_book(symbol, limit=5)
-            
-            # ดึงยอด Balance จริงเฉพาะคู่เทรดปัจจุบัน
+            # ดึง Order Book เฉพาะเมื่อมี API Key หรือดึงผ่าน Public Stream ได้
+            orderbook = {'bids': [], 'asks': []}
+            try:
+                orderbook_data = await exchange.watch_order_book(symbol, limit=5)
+                orderbook['bids'] = orderbook_data.get('bids', [])[:5]
+                orderbook['asks'] = orderbook_data.get('asks', [])[:5]
+            except Exception as ex_ob:
+                print(f"[{exchange_id}] Orderbook fetch error: {ex_ob}")
+
+            # ดึงยอด Balance จริงเมื่อใส่ API Key เท่านั้น
+            pair_balances = None
             if has_credentials:
                 try:
                     bal = await exchange.fetch_balance()
-                    pair_balances[quote_asset] = float(bal['total'].get(quote_asset, 0.0))
-                    pair_balances[base_asset] = float(bal['total'].get(base_asset, 0.0))
+                    pair_balances = {
+                        quote_asset: float(bal['total'].get(quote_asset, 0.0)),
+                        base_asset: float(bal['total'].get(base_asset, 0.0))
+                    }
                 except Exception as ex:
                     print(f"[{exchange_id}] Balance fetch error: {ex}")
-            else:
-                # ค่าจำลองสำหรับคู่เทรดต่างๆ กรณีไม่ได้ใส่ API Key
-                mock_base_vals = {'BTC/USDT': 0.4520, 'ETH/USDT': 3.2500, 'VELO/USDT': 150000.0}
-                base_mock = mock_base_vals.get(symbol, 1.0)
-                mock_vals = {
-                    'binance': {quote_asset: 12540.50, base_asset: base_mock},
-                    'okx': {quote_asset: 8320.00, base_asset: base_mock * 0.5},
-                    'bybit': {quote_asset: 5410.25, base_asset: base_mock * 0.2},
-                    'kucoin': {quote_asset: 3150.00, base_asset: 0.0},
-                    'gate': {quote_asset: 1890.75, base_asset: base_mock * 0.1}
-                }
-                pair_balances = mock_vals.get(exchange_id, {quote_asset: 0.0, base_asset: 0.0})
+                    pair_balances = {quote_asset: 0.0, base_asset: 0.0}
 
             payload = {
                 "exchange": exchange_id,
                 "symbol": symbol,
                 "base_asset": base_asset,
                 "quote_asset": quote_asset,
-                "bids": orderbook['bids'][:5],
-                "asks": orderbook['asks'][:5],
+                "bids": orderbook['bids'],
+                "asks": orderbook['asks'],
                 "balance": pair_balances,
                 "is_live": has_credentials
             }
@@ -306,7 +302,7 @@ async def get_dashboard():
 
             exchanges.forEach(ex => {
                 const exName = ex.toUpperCase();
-                exchangeData[ex] = { bids: [], asks: [], balance: {}, base_asset: 'BTC', quote_asset: 'USDT' };
+                exchangeData[ex] = { bids: [], asks: [], balance: null, base_asset: 'BTC', quote_asset: 'USDT', is_live: false };
 
                 const savedKey = localStorage.getItem(`${ex}_apiKey`) || '';
                 const savedSec = localStorage.getItem(`${ex}_secret`) || '';
@@ -326,9 +322,11 @@ async def get_dashboard():
                 bCard.id = `balance-${ex}`;
                 bCard.className = 'bg-slate-950/60 border border-slate-800/60 rounded-xl p-3';
                 bCard.innerHTML = `
-                    <div class="text-xs font-bold text-slate-400 mb-1">${exName}</div>
-                    <div class="text-sm font-bold text-emerald-400 font-mono">$0.00 USDT</div>
-                    <div class="text-xs text-cyan-300 font-mono mt-0.5">0.0000 BTC</div>
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="text-xs font-bold text-slate-400">${exName}</span>
+                        <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
+                    </div>
+                    <div class="text-xs text-slate-500 py-2">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลพอร์ต</div>
                 `;
                 balanceContainer.appendChild(bCard);
 
@@ -341,13 +339,13 @@ async def get_dashboard():
                             <span class="text-[10px] uppercase font-semibold px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/50">Spot</span>
                         </div>
                         <div class="space-y-1 mb-2" id="${ex}-asks">
-                            <div class="text-xs text-slate-500 text-center py-4">Waiting for data...</div>
+                            <div class="text-xs text-slate-500 text-center py-4">Waiting for connection...</div>
                         </div>
                         <div class="py-1 text-center text-xs text-slate-500 border-y border-slate-800/50 my-1 bg-slate-950/30 rounded">
                             Spread: <span id="${ex}-spread" class="text-slate-400 font-mono">-</span>
                         </div>
                         <div class="space-y-1 mb-4" id="${ex}-bids">
-                            <div class="text-xs text-slate-500 text-center py-4">Waiting for data...</div>
+                            <div class="text-xs text-slate-500 text-center py-4">Waiting for connection...</div>
                         </div>
                     </div>
 
@@ -370,9 +368,9 @@ async def get_dashboard():
             totalCard.id = 'total-balance-card';
             totalCard.className = 'bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-3 shadow-inner';
             totalCard.innerHTML = `
-                <div class="text-xs font-bold text-cyan-400 mb-1">TOTAL POSITION</div>
+                <div class="text-xs font-bold text-cyan-400 mb-1">TOTAL POSITION (LIVE API)</div>
                 <div class="text-sm font-bold text-cyan-200 font-mono" id="total-quote">$0.00 USDT</div>
-                <div class="text-xs text-cyan-300 font-mono mt-0.5" id="total-base">0.0000 BTC</div>
+                <div class="text-xs text-cyan-300 font-mono mt-0.5" id="total-base">0.0000 BTC <span class="text-slate-400 font-normal" id="total-base-val">(≈ $0.00)</span></div>
             `;
             balanceContainer.appendChild(totalCard);
         }
@@ -445,7 +443,7 @@ async def get_dashboard():
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                if (data.exchange && data.bids && data.asks) {
+                if (data.exchange) {
                     exchangeData[data.exchange] = data;
                     renderExchange(data.exchange);
                     updateTotalBalance();
@@ -463,61 +461,95 @@ async def get_dashboard():
         function renderExchange(ex) {
             const item = exchangeData[ex];
             
-            let asksHTML = '';
-            const sortedAsks = [...item.asks].reverse();
-            sortedAsks.forEach(ask => {
-                const pDecimals = currentSelectedSymbol.includes('VELO') ? 4 : 2;
-                asksHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-rose-400">${Number(ask[0]).toFixed(pDecimals)}</span><span class="text-slate-400">${Number(ask[1]).toFixed(2)}</span></div>`;
-            });
-            document.getElementById(`${ex}-asks`).innerHTML = asksHTML;
+            // Order Book Rendering
+            if (item.asks && item.asks.length > 0) {
+                let asksHTML = '';
+                const sortedAsks = [...item.asks].reverse();
+                sortedAsks.forEach(ask => {
+                    const pDecimals = currentSelectedSymbol.includes('VELO') ? 4 : 2;
+                    asksHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-rose-400">${Number(ask[0]).toFixed(pDecimals)}</span><span class="text-slate-400">${Number(ask[1]).toFixed(2)}</span></div>`;
+                });
+                document.getElementById(`${ex}-asks`).innerHTML = asksHTML;
+            } else {
+                document.getElementById(`${ex}-asks`).innerHTML = `<div class="text-xs text-slate-500 text-center py-4">No data</div>`;
+            }
 
-            let bidsHTML = '';
-            item.bids.forEach(bid => {
-                const pDecimals = currentSelectedSymbol.includes('VELO') ? 4 : 2;
-                bidsHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-emerald-400">${Number(bid[0]).toFixed(pDecimals)}</span><span class="text-slate-400">${Number(bid[1]).toFixed(2)}</span></div>`;
-            });
-            document.getElementById(`${ex}-bids`).innerHTML = bidsHTML;
+            if (item.bids && item.bids.length > 0) {
+                let bidsHTML = '';
+                item.bids.forEach(bid => {
+                    const pDecimals = currentSelectedSymbol.includes('VELO') ? 4 : 2;
+                    bidsHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-emerald-400">${Number(bid[0]).toFixed(pDecimals)}</span><span class="text-slate-400">${Number(bid[1]).toFixed(2)}</span></div>`;
+                });
+                document.getElementById(`${ex}-bids`).innerHTML = bidsHTML;
+            } else {
+                document.getElementById(`${ex}-bids`).innerHTML = `<div class="text-xs text-slate-500 text-center py-4">No data</div>`;
+            }
 
-            if(item.asks.length > 0 && item.bids.length > 0) {
+            if(item.asks && item.asks.length > 0 && item.bids && item.bids.length > 0) {
                 const spread = item.asks[0][0] - item.bids[0][0];
                 const pDecimals = currentSelectedSymbol.includes('VELO') ? 4 : 2;
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(pDecimals);
             }
 
+            // Balance Card Rendering (เฉพาะ Exchange ที่เชื่อมต่อ API Live สำเร็จเท่านั้น)
             const bCard = document.getElementById(`balance-${ex}`);
-            if(bCard && item.balance) {
-                const baseAsset = item.base_asset || 'BTC';
-                const quoteAsset = item.quote_asset || 'USDT';
-                const baseVal = Number(item.balance[baseAsset] || 0);
-                const quoteVal = Number(item.balance[quoteAsset] || 0);
+            if (bCard) {
+                if (item.is_live && item.balance) {
+                    const baseAsset = item.base_asset || 'BTC';
+                    const quoteAsset = item.quote_asset || 'USDT';
+                    const baseVal = Number(item.balance[baseAsset] || 0);
+                    const quoteVal = Number(item.balance[quoteAsset] || 0);
 
-                const liveBadge = item.is_live ? '<span class="text-[9px] text-emerald-400 bg-emerald-950/60 px-1 rounded border border-emerald-800">LIVE API</span>' : '<span class="text-[9px] text-slate-500">MOCK</span>';
+                    let currentPrice = 0;
+                    if (item.asks && item.asks.length > 0) {
+                        currentPrice = Number(item.asks[0][0]);
+                    }
+                    const baseValueInUsdt = baseVal * currentPrice;
+                    const bDecimals = baseAsset === 'VELO' ? 2 : 4;
 
-                const bDecimals = baseAsset === 'VELO' ? 2 : 4;
-
-                bCard.innerHTML = `
-                    <div class="flex justify-between items-center mb-1">
-                        <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
-                        ${liveBadge}
-                    </div>
-                    <div class="text-sm font-bold text-emerald-400 font-mono">$${quoteVal.toLocaleString('en-US', {minimumFractionDigits: 2})} ${quoteAsset}</div>
-                    <div class="text-xs text-cyan-300 font-mono mt-0.5">${baseVal.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})} ${baseAsset}</div>
-                `;
+                    bCard.innerHTML = `
+                        <div class="flex justify-between items-center mb-1">
+                            <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
+                            <span class="text-[9px] text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800/80 font-semibold">LIVE API</span>
+                        </div>
+                        <div class="text-sm font-bold text-emerald-400 font-mono">$${quoteVal.toLocaleString('en-US', {minimumFractionDigits: 2})} ${quoteAsset}</div>
+                        <div class="text-xs text-cyan-300 font-mono mt-0.5">
+                            ${baseVal.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})} ${baseAsset}
+                            <span class="text-slate-400 font-normal text-[11px] block sm:inline">(≈ $${baseValueInUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})})</span>
+                        </div>
+                    `;
+                } else {
+                    bCard.innerHTML = `
+                        <div class="flex justify-between items-center mb-1">
+                            <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
+                            <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
+                        </div>
+                        <div class="text-xs text-slate-500 py-2">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลพอร์ต</div>
+                    `;
+                }
             }
         }
 
         function updateTotalBalance() {
             let totalQuote = 0;
             let totalBase = 0;
+            let totalBaseInUsdt = 0;
             let currentBaseAsset = currentSelectedSymbol.split('/')[0];
             let currentQuoteAsset = 'USDT';
+            let liveCount = 0;
 
             Object.values(exchangeData).forEach(d => {
-                if(d.balance) {
+                if(d.is_live && d.balance) {
+                    liveCount++;
                     currentBaseAsset = d.base_asset || currentBaseAsset;
                     currentQuoteAsset = d.quote_asset || 'USDT';
+                    const baseAmt = Number(d.balance[currentBaseAsset] || 0);
                     totalQuote += Number(d.balance[currentQuoteAsset] || 0);
-                    totalBase += Number(d.balance[currentBaseAsset] || 0);
+                    totalBase += baseAmt;
+
+                    let px = 0;
+                    if(d.asks && d.asks.length > 0) px = Number(d.asks[0][0]);
+                    totalBaseInUsdt += (baseAmt * px);
                 }
             });
 
@@ -526,8 +558,13 @@ async def get_dashboard():
             const bDecimals = currentBaseAsset === 'VELO' ? 2 : 4;
 
             if(totalQuoteElem && totalBaseElem) {
-                totalQuoteElem.innerText = `$${totalQuote.toLocaleString('en-US', {minimumFractionDigits: 2})} ${currentQuoteAsset}`;
-                totalBaseElem.innerText = `${totalBase.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})} ${currentBaseAsset}`;
+                if (liveCount > 0) {
+                    totalQuoteElem.innerText = `$${totalQuote.toLocaleString('en-US', {minimumFractionDigits: 2})} ${currentQuoteAsset}`;
+                    totalBaseElem.innerHTML = `${totalBase.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})} ${currentBaseAsset} <span class="text-slate-400 font-normal">(≈ $${totalBaseInUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})})</span>`;
+                } else {
+                    totalQuoteElem.innerText = "$0.00 USDT";
+                    totalBaseElem.innerHTML = `0.0000 ${currentBaseAsset} <span class="text-slate-500 font-normal">(ยังไม่มี API ที่เชื่อมต่อ)</span>`;
+                }
             }
         }
 
@@ -536,6 +573,12 @@ async def get_dashboard():
         let selectedAmount = 0;
 
         function openOrderModal(exchange, type) {
+            const currentItem = exchangeData[exchange];
+            if (!currentItem || !currentItem.is_live) {
+                alert(`กรุณาใส่ API Key ของ ${exchange.toUpperCase()} ก่อนส่งคำสั่งซื้อขาย`);
+                return;
+            }
+
             selectedEx = exchange;
             selectedType = type;
             const amountInput = document.getElementById(`${exchange}-amount`);
@@ -552,7 +595,6 @@ async def get_dashboard():
             document.getElementById('modal-type').className = `font-semibold ${type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`;
             document.getElementById('modal-amount').innerText = `$${selectedAmount.toLocaleString('en-US')} USDT`;
             
-            const currentItem = exchangeData[exchange];
             let refPrice = '0.00';
             if (currentItem && currentItem.asks && currentItem.bids) {
                 if (type === 'BUY' && currentItem.asks.length > 0) refPrice = currentItem.asks[0][0];
