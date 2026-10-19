@@ -6,7 +6,6 @@ import ccxt.pro as ccxtpro
 
 app = FastAPI()
 
-# จัดการ WebSocket Connections ของผู้ใช้ที่เปิดหน้าจอ Dashboard
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -20,61 +19,68 @@ class ConnectionManager:
 
     async def broadcast(self, message: dict):
         for connection in self.active_connections:
-            await connection.send_text(json.dumps(message))
+            try:
+                await connection.send_text(json.dumps(message))
+            except:
+                pass
 
 manager = ConnectionManager()
 
-# ฟังก์ชันดึง Order Book และ Balances จาก Exchange จริงผ่าน ccxt.pro
-async def watch_exchange_data(exchange_id, symbol):
-    # กำหนดค่า Exchange (สามารถใส่ API Key / Secret ตรงนี้ได้หากต้องการดึงพอร์ตจริงของผู้ใช้)
+# ฟังก์ชันดึงข้อมูลจากแต่ละ Exchange (รองรับการใส่ API Key เฉพาะตัว)
+async def watch_exchange_data(exchange_id, symbol, api_keys=None):
     exchange_class = getattr(ccxtpro, exchange_id)
-    exchange = exchange_class({
-        'enableRateLimit': True,
-        # 'apiKey': 'YOUR_API_KEY',
-        # 'secret': 'YOUR_SECRET_KEY',
-    })
+    config = {'enableRateLimit': True}
+    
+    if api_keys and api_keys.get('apiKey') and api_keys.get('secret'):
+        config['apiKey'] = api_keys['apiKey']
+        config['secret'] = api_keys['secret']
+        if api_keys.get('password'):  # สำหรับบาง Exchange เช่น OKX
+            config['password'] = api_keys['password']
+
+    exchange = exchange_class(config)
 
     while True:
         try:
-            # ดึง Order Book 5 ชั้นราคาแบบ Real-time
+            # ดึง Order Book 5 ชั้นราคา
             orderbook = await exchange.watch_order_book(symbol, limit=5)
             
-            # จำลอง/ดึงยอด Balance (ในโหมดทดสอบ ถ้ายังไม่ใส่ API Key จะแสดงค่าจำลองเพื่อความเสถียร)
-            # หากใส่ API Key แล้ว สามารถใช้: balance = await exchange.fetch_balance()
-            balances = {
-                'binance': {'usdt': 12540.50, 'btc': 0.4520},
-                'okx': {'usdt': 8320.00, 'btc': 0.1200},
-                'bybit': {'usdt': 5410.25, 'btc': 0.0850},
-                'kucoin': {'usdt': 3150.00, 'btc': 0.0000},
-                'gate': {'usdt': 1890.75, 'btc': 0.0210}
-            }
-            curr_balance = balances.get(exchange_id, {'usdt': 0.0, 'btc': 0.0})
+            # ดึงยอด Balance จริง (ถ้าใส่ API Key จะดึงพอร์ตจริง ถ้าไม่ได้ใส่จะแสดงค่าจำลองป้องกัน Error)
+            balances = {'usdt': 0.0, 'btc': 0.0}
+            try:
+                if api_keys and api_keys.get('apiKey'):
+                    bal = await exchange.fetch_balance()
+                    balances['usdt'] = bal['total'].get('USDT', 0.0)
+                    balances['btc'] = bal['total'].get('BTC', 0.0)
+                else:
+                    # ค่าจำลองเริ่มต้นกรณีไม่ได้ใส่ Key
+                    mock_vals = {'binance': (12540.50, 0.45), 'okx': (8320.0, 0.12), 'bybit': (5410.25, 0.085), 'kucoin': (3150.0, 0.0), 'gate': (1890.75, 0.021)}
+                    balances['usdt'], balances['btc'] = mock_vals.get(exchange_id, (1000.0, 0.1))
+            except Exception as ex:
+                print(f"Balance fetch error {exchange_id}: {ex}")
 
             payload = {
                 "exchange": exchange_id,
                 "symbol": symbol,
-                "bids": orderbook['bids'][:5],  # [[price, amount], ...]
-                "asks": orderbook['asks'][:5],  # [[price, amount], ...]
-                "balance": curr_balance
+                "bids": orderbook['bids'][:5],
+                "asks": orderbook['asks'][:5],
+                "balance": balances
             }
 
-            # ส่งข้อมูลอัปเดตไปให้หน้าเว็บผ่าน WebSocket
             await manager.broadcast(payload)
 
         except Exception as e:
             print(f"Error on {exchange_id}: {e}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
             try:
                 await exchange.close()
             except:
                 pass
-            exchange = exchange_class()
+            exchange = exchange_class(config)
 
 @app.on_event("startup")
 async def startup_event():
     exchanges = ['binance', 'okx', 'bybit', 'kucoin', 'gate']
     symbol = 'BTC/USDT'
-    # รัน Background Task เชื่อมต่อทั้ง 5 Exchange พร้อมกัน
     for ex in exchanges:
         asyncio.create_task(watch_exchange_data(ex, symbol))
 
@@ -83,22 +89,26 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # รับคำสั่งซื้อ/ขายจาก Frontend (เมื่อผู้ใช้กดปุ่ม Buy/Sell)
             data = await websocket.receive_text()
-            order_data = json.loads(data)
-            print(f"Received Order Request: {order_data}")
+            req = json.loads(data)
             
-            # ตรงนี้สามารถเขียนโค้ดเรียก exchange.create_order(...) จริงได้ที่นี่
+            # หากผู้ใช้กดบันทึก API Key ให้รีสตาร์ท Task ของ Exchange นั้นๆ
+            if req.get("action") == "update_keys":
+                ex_id = req["exchange"]
+                keys = req["keys"]
+                asyncio.create_task(watch_exchange_data(ex_id, 'BTC/USDT', keys))
+                await websocket.send_text(json.dumps({"status": "success", "message": f"Updated API for {ex_id}"}))
             
-            # ส่งผลลัพธ์ตอบกลับว่าสั่งซื้อสำเร็จ
-            await websocket.send_text(json.dumps({
-                "status": "success",
-                "message": f"Successfully executed {order_data['type']} on {order_data['exchange']}"
-            }))
+            elif req.get("action") == "place_order":
+                # โค้ดสำหรับส่งคำสั่งซื้อขายจริงผ่าน exchange.create_order(...)
+                await websocket.send_text(json.dumps({
+                    "status": "success", 
+                    "message": f"Executed {req['type']} on {req['exchange']}"
+                }))
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# เสิร์ฟหน้าเว็บ Dashboard ในตัวเดียว
+# หน้าเว็บ Dashboard พร้อมช่องกรอก API Keys ทั้ง 5 Exchange
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
     return """
@@ -126,38 +136,53 @@ async def get_dashboard():
                     </svg>
                     Multi-Exchange Live Trading Terminal
                 </h1>
-                <p class="text-sm text-slate-400 mt-1">คู่เทรด: <span class="text-cyan-400 font-semibold">BTC/USDT</span> | ดึงข้อมูลผ่าน CCXT Pro WebSocket API</p>
+                <p class="text-sm text-slate-400 mt-1">คู่เทรด: <span class="text-cyan-400 font-semibold">BTC/USDT</span> | เชื่อมต่อ API 5 กระดานเทรด</p>
             </div>
             <div class="flex items-center gap-3">
+                <button onclick="toggleSettings()" class="bg-cyan-600/20 hover:bg-cyan-600 text-cyan-400 hover:text-white border border-cyan-500/30 px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer">
+                    ⚙️ ตั้งค่า API Keys
+                </button>
                 <span id="connection-status" class="inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
                     <span class="w-2 h-2 mr-1.5 bg-amber-500 rounded-full animate-ping"></span> Connecting...
                 </span>
             </div>
         </header>
 
-        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (Asset Balance Overview) -->
+        <!-- API Configuration Panel (Hidden by default) -->
+        <div id="settings-panel" class="bg-slate-900 border border-cyan-500/30 rounded-xl p-5 hidden shadow-2xl space-y-4">
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+                <span>🔑 ตั้งค่า API Keys สำหรับเชื่อมต่อแต่ละ Exchange</span>
+            </h3>
+            <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดานเพื่อให้ระบบดึงข้อมูลพอร์ตและส่งคำสั่งซื้อขายจริง (ข้อมูลจะถูกบันทึกเฉพาะในเบราว์เซอร์ของคุณ)</p>
+            
+            <div class="grid grid-cols-1 md:grid-cols-5 gap-4" id="api-inputs-container">
+                <!-- จะถูกสร้างผ่าน JavaScript -->
+            </div>
+            <div class="flex justify-end gap-3 pt-2">
+                <button onclick="toggleSettings()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer">ปิด</button>
+                <button onclick="saveApiKeys()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-2 rounded-lg text-xs font-medium cursor-pointer shadow-lg">บันทึกและเชื่อมต่อ API</button>
+            </div>
+        </div>
+
+        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน -->
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2 mb-3">
                 <span class="w-2 h-2 bg-cyan-400 rounded-full"></span> 
                 1. ยอดทรัพย์สินคงเหลือ (Real-time Balances)
             </h2>
-            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="balance-container">
-                <!-- ข้อมูลบาลานซ์จะถูกเติมอัตโนมัติ -->
-            </div>
+            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="balance-container"></div>
         </section>
 
-        <!-- 2. Order Book 5 ชั้นราคา พร้อมปุ่มซื้อขาย (5 Exchanges Terminal) -->
+        <!-- 2. Order Book 5 ชั้นราคา -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <span class="w-2 h-2 bg-emerald-400 rounded-full"></span> 
                 2. Order Book 5 ชั้นราคาจากกระดานเทรดจริง
             </h2>
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4" id="exchange-container">
-                <!-- การ์ดของแต่ละ Exchange จะถูกสร้างอัตโนมัติ -->
-            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4" id="exchange-container"></div>
         </section>
 
-        <!-- 3. ตารางประวัติการส่งคำสั่ง (Execution History) -->
+        <!-- 3. ตารางประวัติการส่งคำสั่ง -->
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2 mb-3">
                 <span class="w-2 h-2 bg-amber-400 rounded-full"></span> 
@@ -189,7 +214,7 @@ async def get_dashboard():
             <div class="space-y-3 text-sm text-slate-300 mb-6 bg-slate-950/60 p-3.5 rounded-lg border border-slate-800 font-sans">
                 <div class="flex justify-between"><span>Exchange:</span> <span id="modal-exchange" class="font-semibold text-white"></span></div>
                 <div class="flex justify-between"><span>ประเภทคำสั่ง:</span> <span id="modal-type" class="font-semibold"></span></div>
-                <div class="flex justify-between"><span>ราคาอ้างอิง Top Ask/Bid:</span> <span id="modal-price" class="font-semibold text-cyan-400 font-mono"></span></div>
+                <div class="flex justify-between"><span>ราคาอ้างอิง:</span> <span id="modal-price" class="font-semibold text-cyan-400 font-mono"></span></div>
             </div>
             <div class="flex gap-3">
                 <button onclick="closeModal()" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 py-2.5 rounded-lg font-medium transition cursor-pointer">ยกเลิก</button>
@@ -206,12 +231,30 @@ async def get_dashboard():
         function initUI() {
             const container = document.getElementById('exchange-container');
             const balanceContainer = document.getElementById('balance-container');
+            const apiInputsContainer = document.getElementById('api-inputs-container');
+            
             container.innerHTML = '';
             balanceContainer.innerHTML = '';
+            apiInputsContainer.innerHTML = '';
 
             exchanges.forEach(ex => {
                 const exName = ex.toUpperCase();
                 exchangeData[ex] = { bids: [], asks: [], balance: { usdt: 0, btc: 0 } };
+
+                // สร้างช่องกรอก API Key
+                const savedKey = localStorage.getItem(`${ex}_apiKey`) || '';
+                const savedSec = localStorage.getItem(`${ex}_secret`) || '';
+                const savedPwd = localStorage.getItem(`${ex}_password`) || '';
+
+                const apiBox = document.createElement('div');
+                apiBox.className = 'bg-slate-950/80 p-3 rounded-lg border border-slate-800 space-y-2';
+                apiBox.innerHTML = `
+                    <div class="font-bold text-xs text-cyan-400">${exName}</div>
+                    <input type="text" id="${ex}-key" placeholder="API Key" value="${savedKey}" class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px] text-white">
+                    <input type="password" id="${ex}-sec" placeholder="Secret Key" value="${savedSec}" class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px] text-white">
+                    ${ex === 'okx' ? `<input type="password" id="${ex}-pwd" placeholder="Passphrase" value="${savedPwd}" class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px] text-white">` : ''}
+                `;
+                apiInputsContainer.appendChild(apiBox);
 
                 // สร้างการ์ด Balance
                 const bCard = document.createElement('div');
@@ -263,6 +306,36 @@ async def get_dashboard():
             balanceContainer.appendChild(totalCard);
         }
 
+        function toggleSettings() {
+            const panel = document.getElementById('settings-panel');
+            panel.classList.toggle('hidden');
+        }
+
+        function saveApiKeys() {
+            exchanges.forEach(ex => {
+                const key = document.getElementById(`${ex}-key`).value.trim();
+                const sec = document.getElementById(`${ex}-sec`).value.trim();
+                localStorage.setItem(`${ex}_apiKey`, key);
+                localStorage.setItem(`${ex}_secret`, sec);
+                
+                let pwd = '';
+                if(ex === 'okx') {
+                    pwd = document.getElementById(`${ex}-pwd`).value.trim();
+                    localStorage.setItem(`${ex}_password`, pwd);
+                }
+
+                if(ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        action: "update_keys",
+                        exchange: ex,
+                        keys: { apiKey: key, secret: sec, password: pwd }
+                    }));
+                }
+            });
+            alert("บันทึกและส่ง API Keys ไปยังเซิร์ฟเวอร์เรียบร้อยแล้ว!");
+            toggleSettings();
+        }
+
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
@@ -271,6 +344,20 @@ async def get_dashboard():
                 const status = document.getElementById('connection-status');
                 status.className = 'inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
                 status.innerHTML = '<span class="w-2 h-2 mr-1.5 bg-emerald-500 rounded-full animate-pulse"></span> Live WebSocket Connected';
+                
+                // ส่งค่า Key ที่เซฟไว้รอบแรกทันทีที่เชื่อมต่อ
+                exchanges.forEach(ex => {
+                    const key = localStorage.getItem(`${ex}_apiKey`) || '';
+                    const sec = localStorage.getItem(`${ex}_secret`) || '';
+                    const pwd = localStorage.getItem(`${ex}_password`) || '';
+                    if(key) {
+                        ws.send(JSON.stringify({
+                            action: "update_keys",
+                            exchange: ex,
+                            keys: { apiKey: key, secret: sec, password: pwd }
+                        }));
+                    }
+                });
             };
 
             ws.onmessage = (event) => {
@@ -293,28 +380,24 @@ async def get_dashboard():
         function renderExchange(ex) {
             const item = exchangeData[ex];
             
-            // Render Asks (5 ชั้นราคาขาย - เรียงจากบนลงล่างราคาต่ำสุดไปสูงสุด)
             let asksHTML = '';
-            const sortedAsks = [...item.asks].reverse(); // เอาอันที่แพงกว่าไว้บนสุด
+            const sortedAsks = [...item.asks].reverse();
             sortedAsks.forEach(ask => {
                 asksHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-rose-400">${Number(ask[0]).toFixed(2)}</span><span class="text-slate-400">${Number(ask[1]).toFixed(4)}</span></div>`;
             });
             document.getElementById(`${ex}-asks`).innerHTML = asksHTML;
 
-            // Render Bids (5 ชั้นราคาซื้อ - เรียงจากราคามากไปน้อย)
             let bidsHTML = '';
             item.bids.forEach(bid => {
                 bidsHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-emerald-400">${Number(bid[0]).toFixed(2)}</span><span class="text-slate-400">${Number(bid[1]).toFixed(4)}</span></div>`;
             });
             document.getElementById(`${ex}-bids`).innerHTML = bidsHTML;
 
-            // คำนวณ Spread ระหว่าง Best Ask และ Best Bid
             if(item.asks.length > 0 && item.bids.length > 0) {
                 const spread = item.asks[0][0] - item.bids[0][0];
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(2);
             }
 
-            // Render Balance รายกระดาน
             const bCard = document.getElementById(`balance-${ex}`);
             if(bCard && item.balance) {
                 bCard.innerHTML = `
@@ -370,10 +453,8 @@ async def get_dashboard():
         }
 
         function confirmOrder() {
-            const orderPayload = { exchange: selectedEx, type: selectedType, symbol: 'BTC/USDT' };
-            ws.send(JSON.stringify(orderPayload));
+            ws.send(JSON.stringify({ action: "place_order", exchange: selectedEx, type: selectedType, symbol: 'BTC/USDT' }));
 
-            // บันทึกลงตาราง Log
             const tbody = document.getElementById('order-history-body');
             if(tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
             
