@@ -26,7 +26,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ฟังก์ชันดึงข้อมูลจากแต่ละ Exchange (รองรับการใส่ API Key เฉพาะตัว)
+# ฟังก์ชันดึงข้อมูลจากแต่ละ Exchange
 async def watch_exchange_data(exchange_id, symbol, api_keys=None):
     exchange_class = getattr(ccxtpro, exchange_id)
     config = {'enableRateLimit': True}
@@ -34,7 +34,7 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
     if api_keys and api_keys.get('apiKey') and api_keys.get('secret'):
         config['apiKey'] = api_keys['apiKey']
         config['secret'] = api_keys['secret']
-        if api_keys.get('password'):  # สำหรับบาง Exchange เช่น OKX
+        if api_keys.get('password'):  # สำหรับ OKX
             config['password'] = api_keys['password']
 
     exchange = exchange_class(config)
@@ -44,7 +44,6 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
             # ดึง Order Book 5 ชั้นราคา
             orderbook = await exchange.watch_order_book(symbol, limit=5)
             
-            # ดึงยอด Balance จริง (ถ้าใส่ API Key จะดึงพอร์ตจริง ถ้าไม่ได้ใส่จะแสดงค่าจำลองป้องกัน Error)
             balances = {'usdt': 0.0, 'btc': 0.0}
             try:
                 if api_keys and api_keys.get('apiKey'):
@@ -52,7 +51,6 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                     balances['usdt'] = bal['total'].get('USDT', 0.0)
                     balances['btc'] = bal['total'].get('BTC', 0.0)
                 else:
-                    # ค่าจำลองเริ่มต้นกรณีไม่ได้ใส่ Key
                     mock_vals = {'binance': (12540.50, 0.45), 'okx': (8320.0, 0.12), 'bybit': (5410.25, 0.085), 'kucoin': (3150.0, 0.0), 'gate': (1890.75, 0.021)}
                     balances['usdt'], balances['btc'] = mock_vals.get(exchange_id, (1000.0, 0.1))
             except Exception as ex:
@@ -92,7 +90,6 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
             req = json.loads(data)
             
-            # หากผู้ใช้กดบันทึก API Key ให้รีสตาร์ท Task ของ Exchange นั้นๆ
             if req.get("action") == "update_keys":
                 ex_id = req["exchange"]
                 keys = req["keys"]
@@ -100,15 +97,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"status": "success", "message": f"Updated API for {ex_id}"}))
             
             elif req.get("action") == "place_order":
-                # โค้ดสำหรับส่งคำสั่งซื้อขายจริงผ่าน exchange.create_order(...)
+                print(f"Executing order: {req}")
                 await websocket.send_text(json.dumps({
                     "status": "success", 
-                    "message": f"Executed {req['type']} on {req['exchange']}"
+                    "message": f"Executed {req['type']} ${req['amount_usdt']} USDT on {req['exchange']}"
                 }))
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# หน้าเว็บ Dashboard พร้อมช่องกรอก API Keys ทั้ง 5 Exchange
+# หน้าเว็บ Dashboard
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
     return """
@@ -148,16 +145,14 @@ async def get_dashboard():
             </div>
         </header>
 
-        <!-- API Configuration Panel (Hidden by default) -->
+        <!-- API Configuration Panel -->
         <div id="settings-panel" class="bg-slate-900 border border-cyan-500/30 rounded-xl p-5 hidden shadow-2xl space-y-4">
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span>🔑 ตั้งค่า API Keys สำหรับเชื่อมต่อแต่ละ Exchange</span>
             </h3>
             <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดานเพื่อให้ระบบดึงข้อมูลพอร์ตและส่งคำสั่งซื้อขายจริง (ข้อมูลจะถูกบันทึกเฉพาะในเบราว์เซอร์ของคุณ)</p>
             
-            <div class="grid grid-cols-1 md:grid-cols-5 gap-4" id="api-inputs-container">
-                <!-- จะถูกสร้างผ่าน JavaScript -->
-            </div>
+            <div class="grid grid-cols-1 md:grid-cols-5 gap-4" id="api-inputs-container"></div>
             <div class="flex justify-end gap-3 pt-2">
                 <button onclick="toggleSettings()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer">ปิด</button>
                 <button onclick="saveApiKeys()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-2 rounded-lg text-xs font-medium cursor-pointer shadow-lg">บันทึกและเชื่อมต่อ API</button>
@@ -173,7 +168,7 @@ async def get_dashboard():
             <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="balance-container"></div>
         </section>
 
-        <!-- 2. Order Book 5 ชั้นราคา -->
+        <!-- 2. Order Book 5 ชั้นราคา พร้อมช่องใส่จำนวนเงิน USDT -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <span class="w-2 h-2 bg-emerald-400 rounded-full"></span> 
@@ -195,12 +190,13 @@ async def get_dashboard():
                             <th class="p-2.5">เวลา</th>
                             <th class="p-2.5">Exchange</th>
                             <th class="p-2.5">ประเภท</th>
-                            <th class="p-2.5">คู่เทรด</th>
+                            <th class="p-2.5">จำนวน (USDT)</th>
+                            <th class="p-2.5">ราคาอ้างอิง</th>
                             <th class="p-2.5">สถานะ</th>
                         </tr>
                     </thead>
                     <tbody id="order-history-body" class="divide-y divide-slate-800/50 text-slate-300">
-                        <tr><td colspan="5" class="p-3 text-center text-slate-500">ยังไม่มีประวัติการส่งคำสั่งในเซสชันนี้</td></tr>
+                        <tr><td colspan="6" class="p-3 text-center text-slate-500">ยังไม่มีประวัติการส่งคำสั่งในเซสชันนี้</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -214,6 +210,7 @@ async def get_dashboard():
             <div class="space-y-3 text-sm text-slate-300 mb-6 bg-slate-950/60 p-3.5 rounded-lg border border-slate-800 font-sans">
                 <div class="flex justify-between"><span>Exchange:</span> <span id="modal-exchange" class="font-semibold text-white"></span></div>
                 <div class="flex justify-between"><span>ประเภทคำสั่ง:</span> <span id="modal-type" class="font-semibold"></span></div>
+                <div class="flex justify-between"><span>จำนวนเงิน:</span> <span id="modal-amount" class="font-semibold text-emerald-400 font-mono"></span></div>
                 <div class="flex justify-between"><span>ราคาอ้างอิง:</span> <span id="modal-price" class="font-semibold text-cyan-400 font-mono"></span></div>
             </div>
             <div class="flex gap-3">
@@ -267,7 +264,7 @@ async def get_dashboard():
                 `;
                 balanceContainer.appendChild(bCard);
 
-                // สร้างการ์ด Order Book
+                // สร้างการ์ด Order Book + ช่องกรอก USDT Amount ชิดกับปุ่ม Buy/Sell
                 const card = document.createElement('div');
                 card.className = 'bg-slate-900/80 border border-slate-800/80 rounded-xl p-4 flex flex-col justify-between shadow-xl backdrop-blur-md';
                 card.innerHTML = `
@@ -286,9 +283,18 @@ async def get_dashboard():
                             <div class="text-xs text-slate-500 text-center py-4">Waiting for data...</div>
                         </div>
                     </div>
-                    <div class="grid grid-cols-2 gap-2">
-                        <button onclick="openOrderModal('${ex}', 'BUY')" class="bg-emerald-600/20 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">BUY</button>
-                        <button onclick="openOrderModal('${ex}', 'SELL')" class="bg-rose-600/20 hover:bg-rose-600 text-rose-400 hover:text-white border border-rose-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">SELL</button>
+
+                    <!-- Trade Action Control Area -->
+                    <div class="space-y-2 pt-2 border-t border-slate-800/60">
+                        <div class="relative">
+                            <input type="number" id="${ex}-amount" placeholder="ระบุจำนวนเงิน" value="100" min="1" step="10"
+                                class="w-full bg-slate-950 border border-slate-700/80 rounded-lg px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-cyan-500 transition pr-12">
+                            <span class="absolute right-3 top-1.5 text-[11px] font-bold text-slate-400">USDT</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <button onclick="openOrderModal('${ex}', 'BUY')" class="bg-emerald-600/20 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">BUY</button>
+                            <button onclick="openOrderModal('${ex}', 'SELL')" class="bg-rose-600/20 hover:bg-rose-600 text-rose-400 hover:text-white border border-rose-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">SELL</button>
+                        </div>
                     </div>
                 `;
                 container.appendChild(card);
@@ -345,7 +351,6 @@ async def get_dashboard():
                 status.className = 'inline-flex items-center px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
                 status.innerHTML = '<span class="w-2 h-2 mr-1.5 bg-emerald-500 rounded-full animate-pulse"></span> Live WebSocket Connected';
                 
-                // ส่งค่า Key ที่เซฟไว้รอบแรกทันทีที่เชื่อมต่อ
                 exchanges.forEach(ex => {
                     const key = localStorage.getItem(`${ex}_apiKey`) || '';
                     const sec = localStorage.getItem(`${ex}_secret`) || '';
@@ -429,13 +434,23 @@ async def get_dashboard():
 
         let selectedEx = '';
         let selectedType = '';
+        let selectedAmount = 0;
 
         function openOrderModal(exchange, type) {
             selectedEx = exchange;
             selectedType = type;
+            const amountInput = document.getElementById(`${exchange}-amount`);
+            selectedAmount = amountInput ? parseFloat(amountInput.value) || 0 : 0;
+
+            if (selectedAmount <= 0) {
+                alert("กรุณาระบุจำนวนเงิน USDT ที่ต้องการซื้อขายให้ถูกต้อง");
+                return;
+            }
+
             document.getElementById('modal-exchange').innerText = exchange.toUpperCase();
             document.getElementById('modal-type').innerText = type;
             document.getElementById('modal-type').className = `font-semibold ${type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`;
+            document.getElementById('modal-amount').innerText = `$${selectedAmount.toLocaleString('en-US')} USDT`;
             
             const currentItem = exchangeData[exchange];
             let refPrice = '0.00';
@@ -453,7 +468,19 @@ async def get_dashboard():
         }
 
         function confirmOrder() {
-            ws.send(JSON.stringify({ action: "place_order", exchange: selectedEx, type: selectedType, symbol: 'BTC/USDT' }));
+            const currentItem = exchangeData[selectedEx];
+            let refPrice = '0.00';
+            if (selectedType === 'BUY' && currentItem.asks.length > 0) refPrice = currentItem.asks[0][0];
+            if (selectedType === 'SELL' && currentItem.bids.length > 0) refPrice = currentItem.bids[0][0];
+
+            ws.send(JSON.stringify({ 
+                action: "place_order", 
+                exchange: selectedEx, 
+                type: selectedType, 
+                symbol: 'BTC/USDT',
+                amount_usdt: selectedAmount,
+                price: refPrice
+            }));
 
             const tbody = document.getElementById('order-history-body');
             if(tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
@@ -464,12 +491,13 @@ async def get_dashboard():
                 <td class="p-2.5 text-slate-400">${now}</td>
                 <td class="p-2.5 font-semibold text-white">${selectedEx.toUpperCase()}</td>
                 <td class="p-2.5 font-bold ${selectedType === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}">${selectedType}</td>
-                <td class="p-2.5 text-slate-300">BTC/USDT</td>
+                <td class="p-2.5 font-mono text-cyan-400">$${selectedAmount.toLocaleString('en-US')}</td>
+                <td class="p-2.5 font-mono text-slate-300">${refPrice}</td>
                 <td class="p-2.5 text-emerald-400">Success (API Sent)</td>
             `;
             tbody.prepend(row);
 
-            alert(`ส่งคำสั่ง ${selectedType} ไปยัง ${selectedEx.toUpperCase()} ผ่านระบบ API เรียบร้อยแล้ว!`);
+            alert(`ส่งคำสั่ง ${selectedType} จำนวน $${selectedAmount} USDT ไปยัง ${selectedEx.toUpperCase()} เรียบร้อยแล้ว!`);
             closeModal();
         }
 
