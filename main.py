@@ -67,14 +67,17 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
             except Exception as ex_ob:
                 print(f"[{exchange_id}] Orderbook fetch error: {ex_ob}")
 
-            # ดึง Balance และคำนวณมูลค่าทุก Asset ทุกๆ 10 รอบ เพื่อป้องกัน Rate Limit
             if has_credentials and (counter % 10 == 0 or not cached_balances):
                 try:
                     bal = await exchange.fetch_balance()
                     total_bal = bal.get('total', {})
-                    non_zero = {k: float(v) for k, v in total_bal.items() if float(v) > 0.0}
+                    
+                    # บังคับให้มี USDT เสมอ แม้ในบัญชีจะเป็น 0
+                    if 'USDT' not in total_bal:
+                        total_bal['USDT'] = 0.0
 
-                    # ดึงราคากลาง (Tickers) เพื่อแปลงทุก Asset เป็น USDT
+                    non_zero = {k: float(v) for k, v in total_bal.items() if float(v) >= 0.0}
+
                     try:
                         tickers = await exchange.fetch_tickers()
                     except:
@@ -328,7 +331,7 @@ async def get_dashboard():
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span>🔑 ตั้งค่า API Keys สำหรับเชื่อมต่อแต่ละ Exchange</span>
             </h3>
-            <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดานเพื่อให้ระบบดึงข้อมูลพอร์ตทุก Asset และส่งคำสั่งซื้อขายจริง</p>
+            <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดานเพื่อให้ระบบดึงข้อมูลพอร์ตทุก Asset พร้อมคำนวณ % สัดส่วน</p>
             
             <div class="grid grid-cols-1 md:grid-cols-5 gap-4" id="api-inputs-container"></div>
             <div class="flex justify-end gap-3 pt-2">
@@ -337,12 +340,12 @@ async def get_dashboard():
             </div>
         </div>
 
-        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (รวมทุก Asset ทุก Exchange + % สัดส่วน) -->
+        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (รวมทุก Asset + USDT + % สัดส่วน) -->
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg space-y-4">
             <div class="flex justify-between items-center">
                 <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                     <span class="w-2 h-2 bg-cyan-400 rounded-full"></span> 
-                    1. ทรัพย์สินทั้งหมดในบัญชีรายกระดานและพอร์ตรวมทุก Asset
+                    1. ทรัพย์สินทั้งหมด (รวม USDT และทุก Asset พร้อมสัดส่วน %)
                 </h2>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3" id="balance-container"></div>
@@ -484,7 +487,7 @@ async def get_dashboard():
                         <span class="text-xs font-bold text-slate-400">${exName}</span>
                         <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
                     </div>
-                    <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลทุก Asset</div>
+                    <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลพอร์ต</div>
                 `;
                 balanceContainer.appendChild(bCard);
 
@@ -545,7 +548,7 @@ async def get_dashboard():
                         <span>TOTAL PORTFOLIO</span>
                         <span class="text-[9px] bg-cyan-900/60 text-cyan-300 px-1.5 py-0.5 rounded border border-cyan-700/60">ALL ASSETS</span>
                     </div>
-                    <div id="total-assets-list" class="space-y-1 text-xs text-slate-300 mt-2 max-h-24 overflow-y-auto">
+                    <div id="total-assets-list" class="space-y-1 text-xs text-slate-300 mt-2 max-h-24 overflow-y-auto pr-1">
                         <div class="text-slate-500">ยังไม่มีข้อมูล API ที่เชื่อมต่อ</div>
                     </div>
                 </div>
@@ -675,7 +678,6 @@ async def get_dashboard():
         function renderExchange(ex) {
             const item = exchangeData[ex];
             
-            // Order Book Rendering
             if (item.asks && item.asks.length > 0) {
                 let asksHTML = '';
                 const sortedAsks = [...item.asks].reverse();
@@ -705,20 +707,27 @@ async def get_dashboard():
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(pDecimals);
             }
 
-            // Balance Card Rendering (แสดงทุก Asset ของกระดานนี้)
             const bCard = document.getElementById(`balance-${ex}`);
             if (bCard) {
                 if (item.is_live && item.all_assets) {
                     let assetsHTML = '';
                     let exTotalUsdt = 0;
 
-                    for (const [asset, data] of Object.entries(item.all_assets)) {
+                    // คำนวณมูลค่ารวมของ Exchange นี้ก่อนเพื่อหา % สัดส่วนรายกระดาน
+                    for (const data of Object.values(item.all_assets)) {
                         exTotalUsdt += data.usdt_value;
+                    }
+
+                    for (const [asset, data] of Object.entries(item.all_assets)) {
+                        const percentage = exTotalUsdt > 0 ? (data.usdt_value / exTotalUsdt) * 100 : 0;
                         const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
                         assetsHTML += `
-                            <div class="flex justify-between text-[11px]">
+                            <div class="flex justify-between items-center text-[11px] py-0.5 border-b border-slate-800/40">
                                 <span class="text-slate-300 font-semibold">${asset}:</span>
-                                <span class="font-mono text-cyan-300">${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} <span class="text-slate-500 text-[10px]">(~$${data.usdt_value.toFixed(2)})</span></span>
+                                <span class="font-mono text-right text-cyan-300">
+                                    ${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} 
+                                    <span class="text-emerald-400 text-[10px]">(${percentage.toFixed(1)}%)</span>
+                                </span>
                             </div>
                         `;
                     }
@@ -730,7 +739,7 @@ async def get_dashboard():
                                 <span class="text-[9px] text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800/80 font-semibold">LIVE API</span>
                             </div>
                             <div class="space-y-1 max-h-24 overflow-y-auto pr-1">
-                                ${assetsHTML || '<div class="text-slate-500 text-xs">ไม่พบ Asset ในบัญชี</div>'}
+                                ${assetsHTML}
                             </div>
                         </div>
                         <div class="pt-2 mt-2 border-t border-slate-800/80 flex justify-between items-center">
@@ -744,7 +753,7 @@ async def get_dashboard():
                             <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
                             <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
                         </div>
-                        <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลทุก Asset</div>
+                        <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลพอร์ต</div>
                     `;
                 }
             }
@@ -755,7 +764,6 @@ async def get_dashboard():
             let aggregatedAssets = {};
             let liveCount = 0;
 
-            // 1. รวมยอดทุก Asset จากทุก Exchange
             Object.values(exchangeData).forEach(d => {
                 if(d.is_live && d.all_assets) {
                     liveCount++;
@@ -774,10 +782,10 @@ async def get_dashboard():
             const totalNetElem = document.getElementById('total-net-val');
 
             if (assetsListElem && totalNetElem) {
-                if (liveCount > 0 && grandTotalUsdt > 0) {
+                if (liveCount > 0) {
                     let htmlList = '';
                     for (const [asset, data] of Object.entries(aggregatedAssets)) {
-                        const percentage = (data.usdt_value / grandTotalUsdt) * 100;
+                        const percentage = grandTotalUsdt > 0 ? (data.usdt_value / grandTotalUsdt) * 100 : 0;
                         const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
                         htmlList += `
                             <div class="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded">
