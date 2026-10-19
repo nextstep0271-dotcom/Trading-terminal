@@ -26,7 +26,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ฟังก์ชันดึงข้อมูลจากแต่ละ Exchange
+# ฟังก์ชันดึงข้อมูล Order Book และ Position Asset เฉพาะคู่เทรดปัจจุบัน
 async def watch_exchange_data(exchange_id, symbol, api_keys=None):
     exchange_class = getattr(ccxtpro, exchange_id)
     config = {'enableRateLimit': True}
@@ -39,29 +39,42 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
 
     exchange = exchange_class(config)
 
+    # แยก Base Asset และ Quote Asset จาก Symbol (เช่น 'BTC/USDT' -> base='BTC', quote='USDT')
+    base_asset, quote_asset = symbol.split('/') if '/' in symbol else ('BTC', 'USDT')
+
     while True:
         try:
             # ดึง Order Book 5 ชั้นราคา
             orderbook = await exchange.watch_order_book(symbol, limit=5)
             
-            balances = {'usdt': 0.0, 'btc': 0.0}
+            # ดึงยอด Balance จริงเฉพาะ 2 สินทรัพย์ที่เทรดอยู่
+            pair_balances = {quote_asset: 0.0, base_asset: 0.0}
             try:
                 if api_keys and api_keys.get('apiKey'):
                     bal = await exchange.fetch_balance()
-                    balances['usdt'] = bal['total'].get('USDT', 0.0)
-                    balances['btc'] = bal['total'].get('BTC', 0.0)
+                    pair_balances[quote_asset] = bal['total'].get(quote_asset, 0.0)
+                    pair_balances[base_asset] = bal['total'].get(base_asset, 0.0)
                 else:
-                    mock_vals = {'binance': (12540.50, 0.45), 'okx': (8320.0, 0.12), 'bybit': (5410.25, 0.085), 'kucoin': (3150.0, 0.0), 'gate': (1890.75, 0.021)}
-                    balances['usdt'], balances['btc'] = mock_vals.get(exchange_id, (1000.0, 0.1))
+                    # ค่าจำลองเริ่มต้นเฉพาะคู่เทรดปัจจุบัน
+                    mock_vals = {
+                        'binance': {quote_asset: 12540.50, base_asset: 0.4520},
+                        'okx': {quote_asset: 8320.00, base_asset: 0.1200},
+                        'bybit': {quote_asset: 5410.25, base_asset: 0.0850},
+                        'kucoin': {quote_asset: 3150.00, base_asset: 0.0000},
+                        'gate': {quote_asset: 1890.75, base_asset: 0.0210}
+                    }
+                    pair_balances = mock_vals.get(exchange_id, {quote_asset: 1000.0, base_asset: 0.1})
             except Exception as ex:
                 print(f"Balance fetch error {exchange_id}: {ex}")
 
             payload = {
                 "exchange": exchange_id,
                 "symbol": symbol,
+                "base_asset": base_asset,
+                "quote_asset": quote_asset,
                 "bids": orderbook['bids'][:5],
                 "asks": orderbook['asks'][:5],
-                "balance": balances
+                "balance": pair_balances
             }
 
             await manager.broadcast(payload)
@@ -133,7 +146,7 @@ async def get_dashboard():
                     </svg>
                     Multi-Exchange Live Trading Terminal
                 </h1>
-                <p class="text-sm text-slate-400 mt-1">คู่เทรด: <span class="text-cyan-400 font-semibold">BTC/USDT</span> | เชื่อมต่อ API 5 กระดานเทรด</p>
+                <p class="text-sm text-slate-400 mt-1">คู่เทรดปัจจุบัน: <span id="current-pair" class="text-cyan-400 font-bold bg-cyan-950/40 px-2 py-0.5 rounded border border-cyan-800/50">BTC/USDT</span> | เชื่อมต่อ 5 กระดานเทรด</p>
             </div>
             <div class="flex items-center gap-3">
                 <button onclick="toggleSettings()" class="bg-cyan-600/20 hover:bg-cyan-600 text-cyan-400 hover:text-white border border-cyan-500/30 px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer">
@@ -159,12 +172,14 @@ async def get_dashboard():
             </div>
         </div>
 
-        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน -->
+        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (เฉพาะสินทรัพย์คู่เทรดปัจจุบัน) -->
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
-            <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2 mb-3">
-                <span class="w-2 h-2 bg-cyan-400 rounded-full"></span> 
-                1. ยอดทรัพย์สินคงเหลือ (Real-time Balances)
-            </h2>
+            <div class="flex justify-between items-center mb-3">
+                <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                    <span class="w-2 h-2 bg-cyan-400 rounded-full"></span> 
+                    1. ปริมาณ Position / Asset คงเหลือรายกระดาน (เฉพาะคู่เทรดปัจจุบัน)
+                </h2>
+            </div>
             <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="balance-container"></div>
         </section>
 
@@ -236,7 +251,7 @@ async def get_dashboard():
 
             exchanges.forEach(ex => {
                 const exName = ex.toUpperCase();
-                exchangeData[ex] = { bids: [], asks: [], balance: { usdt: 0, btc: 0 } };
+                exchangeData[ex] = { bids: [], asks: [], balance: {}, base_asset: 'BTC', quote_asset: 'USDT' };
 
                 // สร้างช่องกรอก API Key
                 const savedKey = localStorage.getItem(`${ex}_apiKey`) || '';
@@ -253,18 +268,18 @@ async def get_dashboard():
                 `;
                 apiInputsContainer.appendChild(apiBox);
 
-                // สร้างการ์ด Balance
+                // สร้างการ์ด Balance (แยกเฉพาะ 2 สินทรัพย์ที่เทรด)
                 const bCard = document.createElement('div');
                 bCard.id = `balance-${ex}`;
                 bCard.className = 'bg-slate-950/60 border border-slate-800/60 rounded-xl p-3';
                 bCard.innerHTML = `
                     <div class="text-xs font-bold text-slate-400 mb-1">${exName}</div>
-                    <div class="text-sm font-bold text-emerald-400 font-mono">$0.00</div>
-                    <div class="text-xs text-slate-400 font-mono mt-0.5">0.0000 BTC</div>
+                    <div class="text-sm font-bold text-emerald-400 font-mono">$0.00 USDT</div>
+                    <div class="text-xs text-cyan-300 font-mono mt-0.5">0.0000 BTC</div>
                 `;
                 balanceContainer.appendChild(bCard);
 
-                // สร้างการ์ด Order Book + ช่องกรอก USDT Amount ชิดกับปุ่ม Buy/Sell
+                // สร้างการ์ด Order Book
                 const card = document.createElement('div');
                 card.className = 'bg-slate-900/80 border border-slate-800/80 rounded-xl p-4 flex flex-col justify-between shadow-xl backdrop-blur-md';
                 card.innerHTML = `
@@ -300,14 +315,14 @@ async def get_dashboard():
                 container.appendChild(card);
             });
 
-            // การ์ด Total Portfolio
+            // การ์ด Total Portfolio ของคู่เทรดนี้
             const totalCard = document.createElement('div');
             totalCard.id = 'total-balance-card';
             totalCard.className = 'bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-3 shadow-inner';
             totalCard.innerHTML = `
-                <div class="text-xs font-bold text-cyan-400 mb-1">TOTAL PORT</div>
-                <div class="text-sm font-bold text-cyan-200 font-mono">$0.00</div>
-                <div class="text-xs text-slate-400 font-mono mt-0.5">0.0000 BTC</div>
+                <div class="text-xs font-bold text-cyan-400 mb-1">TOTAL POSITION</div>
+                <div class="text-sm font-bold text-cyan-200 font-mono" id="total-quote">$0.00 USDT</div>
+                <div class="text-xs text-cyan-300 font-mono mt-0.5" id="total-base">0.0000 BTC</div>
             `;
             balanceContainer.appendChild(totalCard);
         }
@@ -369,6 +384,7 @@ async def get_dashboard():
                 const data = JSON.parse(event.data);
                 if (data.exchange && data.bids && data.asks) {
                     exchangeData[data.exchange] = data;
+                    if(data.symbol) document.getElementById('current-pair').innerText = data.symbol;
                     renderExchange(data.exchange);
                     updateTotalBalance();
                 }
@@ -403,32 +419,42 @@ async def get_dashboard():
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(2);
             }
 
+            // แสดงผลพอร์ตเฉพาะ 2 เหรียญของคู่เทรดปัจจุบัน
             const bCard = document.getElementById(`balance-${ex}`);
             if(bCard && item.balance) {
+                const baseAsset = item.base_asset || 'BTC';
+                const quoteAsset = item.quote_asset || 'USDT';
+                const baseVal = Number(item.balance[baseAsset] || 0);
+                const quoteVal = Number(item.balance[quoteAsset] || 0);
+
                 bCard.innerHTML = `
                     <div class="text-xs font-bold text-slate-400 mb-1">${ex.toUpperCase()}</div>
-                    <div class="text-sm font-bold text-emerald-400 font-mono">$${Number(item.balance.usdt).toLocaleString('en-US', {minimumFractionDigits: 2})}</div>
-                    <div class="text-xs text-slate-400 font-mono mt-0.5">${Number(item.balance.btc).toFixed(4)} BTC</div>
+                    <div class="text-sm font-bold text-emerald-400 font-mono">$${quoteVal.toLocaleString('en-US', {minimumFractionDigits: 2})} ${quoteAsset}</div>
+                    <div class="text-xs text-cyan-300 font-mono mt-0.5">${baseVal.toFixed(4)} ${baseAsset}</div>
                 `;
             }
         }
 
         function updateTotalBalance() {
-            let totalUsdt = 0;
-            let totalBtc = 0;
+            let totalQuote = 0;
+            let totalBase = 0;
+            let currentBaseAsset = 'BTC';
+            let currentQuoteAsset = 'USDT';
+
             Object.values(exchangeData).forEach(d => {
                 if(d.balance) {
-                    totalUsdt += Number(d.balance.usdt || 0);
-                    totalBtc += Number(d.balance.btc || 0);
+                    currentBaseAsset = d.base_asset || 'BTC';
+                    currentQuoteAsset = d.quote_asset || 'USDT';
+                    totalQuote += Number(d.balance[currentQuoteAsset] || 0);
+                    totalBase += Number(d.balance[currentBaseAsset] || 0);
                 }
             });
-            const totalCard = document.getElementById('total-balance-card');
-            if(totalCard) {
-                totalCard.innerHTML = `
-                    <div class="text-xs font-bold text-cyan-400 mb-1">TOTAL PORT</div>
-                    <div class="text-sm font-bold text-cyan-200 font-mono">$${totalUsdt.toLocaleString('en-US', {minimumFractionDigits: 2})}</div>
-                    <div class="text-xs text-slate-400 font-mono mt-0.5">${totalBtc.toFixed(4)} BTC</div>
-                `;
+
+            const totalQuoteElem = document.getElementById('total-quote');
+            const totalBaseElem = document.getElementById('total-base');
+            if(totalQuoteElem && totalBaseElem) {
+                totalQuoteElem.innerText = `$${totalQuote.toLocaleString('en-US', {minimumFractionDigits: 2})} ${currentQuoteAsset}`;
+                totalBaseElem.innerText = `${totalBase.toFixed(4)} ${currentBaseAsset}`;
             }
         }
 
@@ -443,7 +469,7 @@ async def get_dashboard():
             selectedAmount = amountInput ? parseFloat(amountInput.value) || 0 : 0;
 
             if (selectedAmount <= 0) {
-                alert("กรุณาระบุจำนวนเงิน USDT ที่ต้องการซื้อขายให้ถูกต้อง");
+                alert("กรุณาระบุจำนวนเงินที่ต้องการซื้อขายให้ถูกต้อง");
                 return;
             }
 
