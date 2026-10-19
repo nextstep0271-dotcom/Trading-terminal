@@ -58,7 +58,6 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
 
     while True:
         try:
-            # ดึง Order Book เฉพาะเมื่อมี API Key หรือดึงผ่าน Public Stream ได้
             orderbook = {'bids': [], 'asks': []}
             try:
                 orderbook_data = await exchange.watch_order_book(symbol, limit=5)
@@ -67,7 +66,6 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
             except Exception as ex_ob:
                 print(f"[{exchange_id}] Orderbook fetch error: {ex_ob}")
 
-            # ดึงยอด Balance จริงเมื่อใส่ API Key เท่านั้น
             pair_balances = None
             if has_credentials:
                 try:
@@ -220,15 +218,15 @@ async def get_dashboard():
             </div>
         </div>
 
-        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน -->
+        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (แยกกระดาน + ผลรวมพอร์ตรวม) -->
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
             <div class="flex justify-between items-center mb-3">
                 <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                     <span class="w-2 h-2 bg-cyan-400 rounded-full"></span> 
-                    1. ปริมาณ Position / Asset คงเหลือรายกระดาน (<span id="balance-pair-title" class="text-cyan-400 font-bold">BTC/USDT</span>)
+                    1. สรุปมูลค่าทรัพย์สินแยกรายกระดานและพอร์ตรวม (<span id="balance-pair-title" class="text-cyan-400 font-bold">BTC/USDT</span>)
                 </h2>
             </div>
-            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="balance-container"></div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3" id="balance-container"></div>
         </section>
 
         <!-- 2. Order Book 5 ชั้นราคา -->
@@ -320,13 +318,13 @@ async def get_dashboard():
 
                 const bCard = document.createElement('div');
                 bCard.id = `balance-${ex}`;
-                bCard.className = 'bg-slate-950/60 border border-slate-800/60 rounded-xl p-3';
+                bCard.className = 'bg-slate-950/60 border border-slate-800/60 rounded-xl p-3 flex flex-col justify-between';
                 bCard.innerHTML = `
                     <div class="flex justify-between items-center mb-1">
                         <span class="text-xs font-bold text-slate-400">${exName}</span>
                         <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
                     </div>
-                    <div class="text-xs text-slate-500 py-2">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลพอร์ต</div>
+                    <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อแสดงยอดพอร์ต</div>
                 `;
                 balanceContainer.appendChild(bCard);
 
@@ -366,11 +364,20 @@ async def get_dashboard():
 
             const totalCard = document.createElement('div');
             totalCard.id = 'total-balance-card';
-            totalCard.className = 'bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-3 shadow-inner';
+            totalCard.className = 'bg-cyan-950/30 border border-cyan-700/50 rounded-xl p-3 flex flex-col justify-between shadow-inner';
             totalCard.innerHTML = `
-                <div class="text-xs font-bold text-cyan-400 mb-1">TOTAL POSITION (LIVE API)</div>
-                <div class="text-sm font-bold text-cyan-200 font-mono" id="total-quote">$0.00 USDT</div>
-                <div class="text-xs text-cyan-300 font-mono mt-0.5" id="total-base">0.0000 BTC <span class="text-slate-400 font-normal" id="total-base-val">(≈ $0.00)</span></div>
+                <div>
+                    <div class="text-xs font-bold text-cyan-400 mb-1 flex justify-between items-center">
+                        <span>TOTAL PORTFOLIO</span>
+                        <span class="text-[9px] bg-cyan-900/60 text-cyan-300 px-1.5 py-0.5 rounded border border-cyan-700/60">ALL EXCHANGES</span>
+                    </div>
+                    <div class="text-xs text-slate-400 mt-1">CASH: <span id="total-quote" class="text-emerald-400 font-bold font-mono">$0.00 USDT</span></div>
+                    <div class="text-xs text-slate-400 mt-0.5">ASSET: <span id="total-base" class="text-cyan-300 font-bold font-mono">0.0000 BTC</span></div>
+                </div>
+                <div class="pt-2 mt-2 border-t border-cyan-800/60 text-right">
+                    <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Net Portfolio Value</span>
+                    <span id="total-net-val" class="text-sm font-extrabold text-cyan-200 font-mono">$0.00 USDT</span>
+                </div>
             `;
             balanceContainer.appendChild(totalCard);
         }
@@ -491,7 +498,7 @@ async def get_dashboard():
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(pDecimals);
             }
 
-            // Balance Card Rendering (เฉพาะ Exchange ที่เชื่อมต่อ API Live สำเร็จเท่านั้น)
+            // Balance Card Rendering (แยกเฉพาะกระดาน)
             const bCard = document.getElementById(`balance-${ex}`);
             if (bCard) {
                 if (item.is_live && item.balance) {
@@ -505,17 +512,32 @@ async def get_dashboard():
                         currentPrice = Number(item.asks[0][0]);
                     }
                     const baseValueInUsdt = baseVal * currentPrice;
+                    const exTotalNetUsdt = quoteVal + baseValueInUsdt;
                     const bDecimals = baseAsset === 'VELO' ? 2 : 4;
 
                     bCard.innerHTML = `
-                        <div class="flex justify-between items-center mb-1">
-                            <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
-                            <span class="text-[9px] text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800/80 font-semibold">LIVE API</span>
+                        <div>
+                            <div class="flex justify-between items-center mb-1.5 pb-1 border-b border-slate-800/80">
+                                <span class="text-xs font-bold text-white tracking-wide">${ex.toUpperCase()}</span>
+                                <span class="text-[9px] text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800/80 font-semibold">LIVE API</span>
+                            </div>
+                            <div class="space-y-1 text-xs">
+                                <div class="flex justify-between">
+                                    <span class="text-slate-400">${quoteAsset}:</span>
+                                    <span class="font-mono font-bold text-emerald-400">$${quoteVal.toLocaleString('en-US', {minimumFractionDigits: 2})}</span>
+                                </div>
+                                <div class="flex justify-between">
+                                    <span class="text-slate-400">${baseAsset}:</span>
+                                    <span class="font-mono text-cyan-300 font-semibold">${baseVal.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})}</span>
+                                </div>
+                                <div class="text-[10px] text-slate-500 text-right">
+                                    (≈ $${baseValueInUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT)
+                                </div>
+                            </div>
                         </div>
-                        <div class="text-sm font-bold text-emerald-400 font-mono">$${quoteVal.toLocaleString('en-US', {minimumFractionDigits: 2})} ${quoteAsset}</div>
-                        <div class="text-xs text-cyan-300 font-mono mt-0.5">
-                            ${baseVal.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})} ${baseAsset}
-                            <span class="text-slate-400 font-normal text-[11px] block sm:inline">(≈ $${baseValueInUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})})</span>
+                        <div class="pt-2 mt-2 border-t border-slate-800/80 flex justify-between items-center">
+                            <span class="text-[10px] font-bold text-slate-400">TOTAL:</span>
+                            <span class="text-xs font-bold font-mono text-cyan-400">$${exTotalNetUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT</span>
                         </div>
                     `;
                 } else {
@@ -524,7 +546,7 @@ async def get_dashboard():
                             <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
                             <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
                         </div>
-                        <div class="text-xs text-slate-500 py-2">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลพอร์ต</div>
+                        <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อแสดงยอดพอร์ต</div>
                     `;
                 }
             }
@@ -555,15 +577,19 @@ async def get_dashboard():
 
             const totalQuoteElem = document.getElementById('total-quote');
             const totalBaseElem = document.getElementById('total-base');
+            const totalNetElem = document.getElementById('total-net-val');
             const bDecimals = currentBaseAsset === 'VELO' ? 2 : 4;
 
-            if(totalQuoteElem && totalBaseElem) {
+            if(totalQuoteElem && totalBaseElem && totalNetElem) {
                 if (liveCount > 0) {
+                    const grandTotalNet = totalQuote + totalBaseInUsdt;
                     totalQuoteElem.innerText = `$${totalQuote.toLocaleString('en-US', {minimumFractionDigits: 2})} ${currentQuoteAsset}`;
                     totalBaseElem.innerHTML = `${totalBase.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})} ${currentBaseAsset} <span class="text-slate-400 font-normal">(≈ $${totalBaseInUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})})</span>`;
+                    totalNetElem.innerText = `$${grandTotalNet.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT`;
                 } else {
                     totalQuoteElem.innerText = "$0.00 USDT";
-                    totalBaseElem.innerHTML = `0.0000 ${currentBaseAsset} <span class="text-slate-500 font-normal">(ยังไม่มี API ที่เชื่อมต่อ)</span>`;
+                    totalBaseElem.innerHTML = `0.0000 ${currentBaseAsset}`;
+                    totalNetElem.innerText = "$0.00 USDT (ยังไม่มี API)";
                 }
             }
         }
