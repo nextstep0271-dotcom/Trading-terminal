@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import ccxt.pro as ccxtpro
@@ -15,57 +16,72 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             try:
                 await connection.send_text(json.dumps(message))
-            except:
-                pass
+            except Exception:
+                self.disconnect(connection)
 
 manager = ConnectionManager()
 
-# ฟังก์ชันดึงข้อมูล Order Book และ Position Asset เฉพาะคู่เทรดปัจจุบัน
+# จัดการ Task ของแต่ละ Exchange ไม่ให้รันซ้ำซ้อน
+running_tasks = {}
+exchange_keys_store = {}
+
 async def watch_exchange_data(exchange_id, symbol, api_keys=None):
     exchange_class = getattr(ccxtpro, exchange_id)
     config = {'enableRateLimit': True}
     
-    if api_keys and api_keys.get('apiKey') and api_keys.get('secret'):
-        config['apiKey'] = api_keys['apiKey']
-        config['secret'] = api_keys['secret']
-        if api_keys.get('password'):  # สำหรับ OKX
-            config['password'] = api_keys['password']
+    # อ่านค่าจาก Environment Variables หรือ Keys ที่ส่งมาจาก Frontend
+    env_key = os.getenv(f"{exchange_id.upper()}_API_KEY", '')
+    env_sec = os.getenv(f"{exchange_id.upper()}_SECRET", '')
+    env_pwd = os.getenv(f"{exchange_id.upper()}_PASSWORD", '')
+
+    apiKey = (api_keys.get('apiKey') if api_keys else '') or env_key
+    secret = (api_keys.get('secret') if api_keys else '') or env_sec
+    password = (api_keys.get('password') if api_keys else '') or env_pwd
+
+    has_credentials = bool(apiKey and secret)
+
+    if has_credentials:
+        config['apiKey'] = apiKey
+        config['secret'] = secret
+        if password:
+            config['password'] = password
 
     exchange = exchange_class(config)
-
-    # แยก Base Asset และ Quote Asset จาก Symbol (เช่น 'BTC/USDT' -> base='BTC', quote='USDT')
     base_asset, quote_asset = symbol.split('/') if '/' in symbol else ('BTC', 'USDT')
+
+    # ยอดเงินเริ่มต้น
+    pair_balances = {quote_asset: 0.0, base_asset: 0.0}
 
     while True:
         try:
-            # ดึง Order Book 5 ชั้นราคา
+            # ดึง Order Book
             orderbook = await exchange.watch_order_book(symbol, limit=5)
             
-            # ดึงยอด Balance จริงเฉพาะ 2 สินทรัพย์ที่เทรดอยู่
-            pair_balances = {quote_asset: 0.0, base_asset: 0.0}
-            try:
-                if api_keys and api_keys.get('apiKey'):
+            # ดึง Balance เฉพาะคู่เทรด
+            if has_credentials:
+                try:
                     bal = await exchange.fetch_balance()
-                    pair_balances[quote_asset] = bal['total'].get(quote_asset, 0.0)
-                    pair_balances[base_asset] = bal['total'].get(base_asset, 0.0)
-                else:
-                    # ค่าจำลองเริ่มต้นเฉพาะคู่เทรดปัจจุบัน
-                    mock_vals = {
-                        'binance': {quote_asset: 12540.50, base_asset: 0.4520},
-                        'okx': {quote_asset: 8320.00, base_asset: 0.1200},
-                        'bybit': {quote_asset: 5410.25, base_asset: 0.0850},
-                        'kucoin': {quote_asset: 3150.00, base_asset: 0.0000},
-                        'gate': {quote_asset: 1890.75, base_asset: 0.0210}
-                    }
-                    pair_balances = mock_vals.get(exchange_id, {quote_asset: 1000.0, base_asset: 0.1})
-            except Exception as ex:
-                print(f"Balance fetch error {exchange_id}: {ex}")
+                    pair_balances[quote_asset] = float(bal['total'].get(quote_asset, 0.0))
+                    pair_balances[base_asset] = float(bal['total'].get(base_asset, 0.0))
+                except Exception as ex:
+                    print(f"[{exchange_id}] Balance fetch error: {ex}")
+            else:
+                # ค่าจำลองสำหรับกรณีไม่ได้ใส่ API Key เท่านั้น
+                mock_vals = {
+                    'binance': {quote_asset: 12540.50, base_asset: 0.4520},
+                    'okx': {quote_asset: 8320.00, base_asset: 0.1200},
+                    'bybit': {quote_asset: 5410.25, base_asset: 0.0850},
+                    'kucoin': {quote_asset: 3150.00, base_asset: 0.0000},
+                    'gate': {quote_asset: 1890.75, base_asset: 0.0210}
+                }
+                pair_balances = mock_vals.get(exchange_id, {quote_asset: 0.0, base_asset: 0.0})
 
             payload = {
                 "exchange": exchange_id,
@@ -74,11 +90,18 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                 "quote_asset": quote_asset,
                 "bids": orderbook['bids'][:5],
                 "asks": orderbook['asks'][:5],
-                "balance": pair_balances
+                "balance": pair_balances,
+                "is_live": has_credentials
             }
 
             await manager.broadcast(payload)
 
+        except asyncio.CancelledError:
+            try:
+                await exchange.close()
+            except:
+                pass
+            break
         except Exception as e:
             print(f"Error on {exchange_id}: {e}")
             await asyncio.sleep(5)
@@ -88,12 +111,25 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                 pass
             exchange = exchange_class(config)
 
+def start_or_restart_exchange(exchange_id, symbol='BTC/USDT', keys=None):
+    # ถ้ารูปแบบ Task เก่ารันอยู่ ให้ Cancel ทิ้งก่อน เพื่อไม่ให้ส่งข้อมูลสลับกัน
+    if exchange_id in running_tasks and not running_tasks[exchange_id].done():
+        running_tasks[exchange_id].cancel()
+    
+    if keys:
+        exchange_keys_store[exchange_id] = keys
+    else:
+        keys = exchange_keys_store.get(exchange_id)
+
+    task = asyncio.create_task(watch_exchange_data(exchange_id, symbol, keys))
+    running_tasks[exchange_id] = task
+
 @app.on_event("startup")
 async def startup_event():
     exchanges = ['binance', 'okx', 'bybit', 'kucoin', 'gate']
     symbol = 'BTC/USDT'
     for ex in exchanges:
-        asyncio.create_task(watch_exchange_data(ex, symbol))
+        start_or_restart_exchange(ex, symbol)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -106,7 +142,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if req.get("action") == "update_keys":
                 ex_id = req["exchange"]
                 keys = req["keys"]
-                asyncio.create_task(watch_exchange_data(ex_id, 'BTC/USDT', keys))
+                # รีสตาร์ท Task ของ Exchange นั้นด้วย Key ใหม่
+                start_or_restart_exchange(ex_id, 'BTC/USDT', keys)
                 await websocket.send_text(json.dumps({"status": "success", "message": f"Updated API for {ex_id}"}))
             
             elif req.get("action") == "place_order":
@@ -118,7 +155,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# หน้าเว็บ Dashboard
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
     return """
@@ -172,7 +208,7 @@ async def get_dashboard():
             </div>
         </div>
 
-        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (เฉพาะสินทรัพย์คู่เทรดปัจจุบัน) -->
+        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน -->
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
             <div class="flex justify-between items-center mb-3">
                 <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
@@ -183,7 +219,7 @@ async def get_dashboard():
             <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" id="balance-container"></div>
         </section>
 
-        <!-- 2. Order Book 5 ชั้นราคา พร้อมช่องใส่จำนวนเงิน USDT -->
+        <!-- 2. Order Book 5 ชั้นราคา -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <span class="w-2 h-2 bg-emerald-400 rounded-full"></span> 
@@ -253,7 +289,6 @@ async def get_dashboard():
                 const exName = ex.toUpperCase();
                 exchangeData[ex] = { bids: [], asks: [], balance: {}, base_asset: 'BTC', quote_asset: 'USDT' };
 
-                // สร้างช่องกรอก API Key
                 const savedKey = localStorage.getItem(`${ex}_apiKey`) || '';
                 const savedSec = localStorage.getItem(`${ex}_secret`) || '';
                 const savedPwd = localStorage.getItem(`${ex}_password`) || '';
@@ -268,7 +303,6 @@ async def get_dashboard():
                 `;
                 apiInputsContainer.appendChild(apiBox);
 
-                // สร้างการ์ด Balance (แยกเฉพาะ 2 สินทรัพย์ที่เทรด)
                 const bCard = document.createElement('div');
                 bCard.id = `balance-${ex}`;
                 bCard.className = 'bg-slate-950/60 border border-slate-800/60 rounded-xl p-3';
@@ -279,7 +313,6 @@ async def get_dashboard():
                 `;
                 balanceContainer.appendChild(bCard);
 
-                // สร้างการ์ด Order Book
                 const card = document.createElement('div');
                 card.className = 'bg-slate-900/80 border border-slate-800/80 rounded-xl p-4 flex flex-col justify-between shadow-xl backdrop-blur-md';
                 card.innerHTML = `
@@ -299,7 +332,6 @@ async def get_dashboard():
                         </div>
                     </div>
 
-                    <!-- Trade Action Control Area -->
                     <div class="space-y-2 pt-2 border-t border-slate-800/60">
                         <div class="relative">
                             <input type="number" id="${ex}-amount" placeholder="ระบุจำนวนเงิน" value="100" min="1" step="10"
@@ -315,7 +347,6 @@ async def get_dashboard():
                 container.appendChild(card);
             });
 
-            // การ์ด Total Portfolio ของคู่เทรดนี้
             const totalCard = document.createElement('div');
             totalCard.id = 'total-balance-card';
             totalCard.className = 'bg-cyan-950/20 border border-cyan-800/40 rounded-xl p-3 shadow-inner';
@@ -353,7 +384,7 @@ async def get_dashboard():
                     }));
                 }
             });
-            alert("บันทึกและส่ง API Keys ไปยังเซิร์ฟเวอร์เรียบร้อยแล้ว!");
+            alert("บันทึกและเชื่อมต่อ API Keys เรียบร้อยแล้ว!");
             toggleSettings();
         }
 
@@ -419,7 +450,6 @@ async def get_dashboard():
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(2);
             }
 
-            // แสดงผลพอร์ตเฉพาะ 2 เหรียญของคู่เทรดปัจจุบัน
             const bCard = document.getElementById(`balance-${ex}`);
             if(bCard && item.balance) {
                 const baseAsset = item.base_asset || 'BTC';
@@ -427,8 +457,13 @@ async def get_dashboard():
                 const baseVal = Number(item.balance[baseAsset] || 0);
                 const quoteVal = Number(item.balance[quoteAsset] || 0);
 
+                const liveBadge = item.is_live ? '<span class="text-[9px] text-emerald-400 bg-emerald-950/60 px-1 rounded border border-emerald-800">LIVE API</span>' : '<span class="text-[9px] text-slate-500">MOCK</span>';
+
                 bCard.innerHTML = `
-                    <div class="text-xs font-bold text-slate-400 mb-1">${ex.toUpperCase()}</div>
+                    <div class="flex justify-between items-center mb-1">
+                        <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
+                        ${liveBadge}
+                    </div>
                     <div class="text-sm font-bold text-emerald-400 font-mono">$${quoteVal.toLocaleString('en-US', {minimumFractionDigits: 2})} ${quoteAsset}</div>
                     <div class="text-xs text-cyan-300 font-mono mt-0.5">${baseVal.toFixed(4)} ${baseAsset}</div>
                 `;
