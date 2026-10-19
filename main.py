@@ -28,7 +28,6 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# จัดการ Task และ State ของแต่ละ Exchange
 running_tasks = {}
 exchange_keys_store = {}
 current_symbol_store = "BTC/USDT"
@@ -79,6 +78,7 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                     pair_balances = {quote_asset: 0.0, base_asset: 0.0}
 
             payload = {
+                "type": "market_data",
                 "exchange": exchange_id,
                 "symbol": symbol,
                 "base_asset": base_asset,
@@ -125,6 +125,75 @@ def change_all_exchanges_symbol(symbol):
     for ex in exchanges:
         start_or_restart_exchange(ex, symbol)
 
+async def execute_live_order(exchange_id, side_type, order_category, symbol, amount_usdt, price):
+    """
+    side_type: 'BUY' หรือ 'SELL'
+    order_category: 'market' หรือ 'limit'
+    """
+    keys = exchange_keys_store.get(exchange_id) or {}
+    env_key = os.getenv(f"{exchange_id.upper()}_API_KEY", '')
+    env_sec = os.getenv(f"{exchange_id.upper()}_SECRET", '')
+    env_pwd = os.getenv(f"{exchange_id.upper()}_PASSWORD", '')
+
+    apiKey = keys.get('apiKey') or env_key
+    secret = keys.get('secret') or env_sec
+    password = keys.get('password') or env_pwd
+
+    if not (apiKey and secret):
+        return {
+            "status": "error",
+            "message": f"ไม่พบ API Key ของ {exchange_id.upper()} กรุณาตั้งค่าก่อนส่งคำสั่ง"
+        }
+
+    try:
+        exchange_class = getattr(ccxtpro, exchange_id)
+        config = {
+            'apiKey': apiKey,
+            'secret': secret,
+            'enableRateLimit': True
+        }
+        if password:
+            config['password'] = password
+
+        exchange = exchange_class(config)
+        
+        target_price = float(price) if price and float(price) > 0 else 1.0
+        amount_coin = float(amount_usdt) / target_price
+        side = side_type.lower() # 'buy' หรือ 'sell'
+        ord_type = order_category.lower() # 'market' หรือ 'limit'
+
+        # ส่งคำสั่งซื้อขายไปยัง Exchange จริง
+        if ord_type == 'limit':
+            order_res = await exchange.create_order(
+                symbol=symbol,
+                type='limit',
+                side=side,
+                amount=amount_coin,
+                price=target_price
+            )
+        else:
+            order_res = await exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=side,
+                amount=amount_coin
+            )
+
+        await exchange.close()
+
+        return {
+            "status": "success",
+            "order_id": order_res.get('id', 'N/A'),
+            "message": f"ส่งคำสั่ง {side_type} ({ord_type.upper()}) คู่ {symbol} จำนวน ${amount_usdt} USDT สำเร็จ!",
+            "details": order_res
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"การส่งคำสั่งล้มเหลว ({exchange_id.upper()}): {str(e)}"
+        }
+
 @app.on_event("startup")
 async def startup_event():
     change_all_exchanges_symbol("BTC/USDT")
@@ -141,20 +210,42 @@ async def websocket_endpoint(websocket: WebSocket):
                 ex_id = req["exchange"]
                 keys = req["keys"]
                 start_or_restart_exchange(ex_id, current_symbol_store, keys)
-                await websocket.send_text(json.dumps({"status": "success", "message": f"Updated API for {ex_id}"}))
+                await websocket.send_text(json.dumps({
+                    "type": "system_msg",
+                    "status": "success", 
+                    "message": f"Updated API for {ex_id}"
+                }))
             
             elif req.get("action") == "change_symbol":
                 new_symbol = req.get("symbol", "BTC/USDT")
-                print(f"Changing trading pair to: {new_symbol}")
                 change_all_exchanges_symbol(new_symbol)
-                await websocket.send_text(json.dumps({"status": "success", "message": f"Switched symbol to {new_symbol}"}))
+                await websocket.send_text(json.dumps({
+                    "type": "system_msg",
+                    "status": "success", 
+                    "message": f"Switched symbol to {new_symbol}"
+                }))
 
             elif req.get("action") == "place_order":
-                print(f"Executing order: {req}")
+                ex_id = req["exchange"]
+                side_type = req["type"] # BUY / SELL
+                order_category = req.get("order_category", "market") # market / limit
+                symbol = req["symbol"]
+                amount_usdt = req["amount_usdt"]
+                price = req["price"]
+
+                result = await execute_live_order(ex_id, side_type, order_category, symbol, amount_usdt, price)
+                
                 await websocket.send_text(json.dumps({
-                    "status": "success", 
-                    "message": f"Executed {req['type']} ${req['amount_usdt']} USDT on {req['exchange']} ({req['symbol']})"
+                    "type": "order_result",
+                    "exchange": ex_id,
+                    "side_type": side_type,
+                    "order_category": order_category,
+                    "symbol": symbol,
+                    "amount_usdt": amount_usdt,
+                    "price": price,
+                    "result": result
                 }))
+
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
@@ -174,6 +265,9 @@ async def get_dashboard():
     </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-4 md:p-6">
+
+    <!-- Toast Notification Overlay -->
+    <div id="toast-container" class="fixed top-5 right-5 z-50 space-y-2 w-80"></div>
 
     <div class="max-w-7xl mx-auto space-y-6">
         <!-- Header -->
@@ -218,7 +312,7 @@ async def get_dashboard():
             </div>
         </div>
 
-        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (แยกกระดาน + ผลรวมพอร์ตรวม) -->
+        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน -->
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
             <div class="flex justify-between items-center mb-3">
                 <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
@@ -229,11 +323,11 @@ async def get_dashboard():
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3" id="balance-container"></div>
         </section>
 
-        <!-- 2. Order Book 5 ชั้นราคา -->
+        <!-- 2. Order Book 5 ชั้นราคา พร้อมเมนูสั่งซื้อขาย (Market / Limit) -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <span class="w-2 h-2 bg-emerald-400 rounded-full"></span> 
-                2. Order Book 5 ชั้นราคาจากกระดานเทรดจริง
+                2. Order Book 5 ชั้นราคาและพาเนลส่งคำสั่ง
             </h2>
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4" id="exchange-container"></div>
         </section>
@@ -242,7 +336,7 @@ async def get_dashboard():
         <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2 mb-3">
                 <span class="w-2 h-2 bg-amber-400 rounded-full"></span> 
-                3. บันทึกคำสั่งซื้อขาย (Execution Log)
+                3. บันทึกผลลัพธ์การส่งคำสั่งซื้อขายจริง (Execution Log & Status Feedback)
             </h2>
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs font-mono">
@@ -252,13 +346,14 @@ async def get_dashboard():
                             <th class="p-2.5">Exchange</th>
                             <th class="p-2.5">คู่เทรด</th>
                             <th class="p-2.5">ประเภท</th>
+                            <th class="p-2.5">โหมด</th>
                             <th class="p-2.5">จำนวน (USDT)</th>
-                            <th class="p-2.5">ราคาอ้างอิง</th>
-                            <th class="p-2.5">สถานะ</th>
+                            <th class="p-2.5">ราคา</th>
+                            <th class="p-2.5">สถานะจาก Exchange</th>
                         </tr>
                     </thead>
                     <tbody id="order-history-body" class="divide-y divide-slate-800/50 text-slate-300">
-                        <tr><td colspan="7" class="p-3 text-center text-slate-500">ยังไม่มีประวัติการส่งคำสั่งในเซสชันนี้</td></tr>
+                        <tr id="empty-history-row"><td colspan="8" class="p-3 text-center text-slate-500">ยังไม่มีประวัติการส่งคำสั่งในเซสชันนี้</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -268,17 +363,18 @@ async def get_dashboard():
     <!-- Order Execution Modal -->
     <div id="order-modal" class="fixed inset-0 bg-black/70 backdrop-blur-xs hidden items-center justify-center z-50">
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 w-96 shadow-2xl">
-            <h3 class="text-lg font-bold mb-4 text-white">ยืนยันคำสั่งซื้อขาย API</h3>
+            <h3 class="text-lg font-bold mb-4 text-white">ยืนยันคำสั่งซื้อขาย API จริง</h3>
             <div class="space-y-3 text-sm text-slate-300 mb-6 bg-slate-950/60 p-3.5 rounded-lg border border-slate-800 font-sans">
                 <div class="flex justify-between"><span>Exchange:</span> <span id="modal-exchange" class="font-semibold text-white"></span></div>
                 <div class="flex justify-between"><span>คู่เทรด:</span> <span id="modal-symbol" class="font-semibold text-cyan-400"></span></div>
                 <div class="flex justify-between"><span>ประเภทคำสั่ง:</span> <span id="modal-type" class="font-semibold"></span></div>
+                <div class="flex justify-between"><span>โหมดคำสั่ง:</span> <span id="modal-category" class="font-bold text-amber-400"></span></div>
                 <div class="flex justify-between"><span>จำนวนเงิน:</span> <span id="modal-amount" class="font-semibold text-emerald-400 font-mono"></span></div>
-                <div class="flex justify-between"><span>ราคาอ้างอิง:</span> <span id="modal-price" class="font-semibold text-cyan-400 font-mono"></span></div>
+                <div class="flex justify-between"><span>ราคาเสนอเทรด:</span> <span id="modal-price" class="font-semibold text-cyan-400 font-mono"></span></div>
             </div>
             <div class="flex gap-3">
                 <button onclick="closeModal()" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 py-2.5 rounded-lg font-medium transition cursor-pointer">ยกเลิก</button>
-                <button onclick="confirmOrder()" class="flex-1 bg-cyan-600 hover:bg-cyan-500 text-white py-2.5 rounded-lg font-medium transition cursor-pointer shadow-lg">ยืนยันส่งคำสั่ง</button>
+                <button id="modal-confirm-btn" onclick="confirmOrder()" class="flex-1 bg-cyan-600 hover:bg-cyan-500 text-white py-2.5 rounded-lg font-medium transition cursor-pointer shadow-lg">ยืนยันส่งคำสั่ง</button>
             </div>
         </div>
     </div>
@@ -288,6 +384,45 @@ async def get_dashboard():
         const exchangeData = {};
         let ws;
         let currentSelectedSymbol = "BTC/USDT";
+
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const isSuccess = type === 'success';
+            
+            toast.className = `p-3 rounded-lg border shadow-xl text-xs font-semibold flex items-center justify-between transition-all duration-300 transform translate-x-full ${
+                isSuccess 
+                ? 'bg-emerald-950/90 border-emerald-500/50 text-emerald-200' 
+                : 'bg-rose-950/90 border-rose-500/50 text-rose-200'
+            }`;
+            
+            toast.innerHTML = `
+                <div class="flex items-center gap-2">
+                    <span>${isSuccess ? '✅' : '❌'}</span>
+                    <span>${message}</span>
+                </div>
+                <button onclick="this.parentElement.remove()" class="text-slate-400 hover:text-white ml-2">✕</button>
+            `;
+            
+            container.appendChild(toast);
+            setTimeout(() => toast.classList.remove('translate-x-full'), 10);
+            setTimeout(() => {
+                toast.classList.add('translate-x-full');
+                setTimeout(() => toast.remove(), 300);
+            }, 5000);
+        }
+
+        function toggleOrderType(ex) {
+            const typeSelect = document.getElementById(`${ex}-ord-type`);
+            const priceContainer = document.getElementById(`${ex}-price-container`);
+            if (typeSelect && priceContainer) {
+                if (typeSelect.value === 'limit') {
+                    priceContainer.classList.remove('hidden');
+                } else {
+                    priceContainer.classList.add('hidden');
+                }
+            }
+        }
 
         function initUI() {
             const container = document.getElementById('exchange-container');
@@ -347,12 +482,27 @@ async def get_dashboard():
                         </div>
                     </div>
 
+                    <!-- Action Control Panel -->
                     <div class="space-y-2 pt-2 border-t border-slate-800/60">
+                        <div class="flex gap-2">
+                            <select id="${ex}-ord-type" onchange="toggleOrderType('${ex}')" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-amber-400 font-semibold w-full focus:outline-none focus:border-cyan-500 cursor-pointer">
+                                <option value="market" selected>Market Order</option>
+                                <option value="limit">Limit Order</option>
+                            </select>
+                        </div>
+                        
                         <div class="relative">
-                            <input type="number" id="${ex}-amount" placeholder="ระบุจำนวนเงิน" value="100" min="1" step="10"
+                            <input type="number" id="${ex}-amount" placeholder="จำนวนเงิน" value="100" min="1" step="10"
                                 class="w-full bg-slate-950 border border-slate-700/80 rounded-lg px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-cyan-500 transition pr-12">
                             <span class="absolute right-3 top-1.5 text-[11px] font-bold text-slate-400">USDT</span>
                         </div>
+
+                        <div id="${ex}-price-container" class="relative hidden">
+                            <input type="number" id="${ex}-limit-price" placeholder="ระบุราคา Limit" step="0.0001"
+                                class="w-full bg-slate-950 border border-amber-500/50 rounded-lg px-3 py-1.5 text-xs text-amber-300 font-mono focus:outline-none focus:border-amber-400 transition pr-12">
+                            <span class="absolute right-3 top-1.5 text-[11px] font-bold text-slate-400">Price</span>
+                        </div>
+
                         <div class="grid grid-cols-2 gap-2">
                             <button onclick="openOrderModal('${ex}', 'BUY')" class="bg-emerald-600/20 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">BUY</button>
                             <button onclick="openOrderModal('${ex}', 'SELL')" class="bg-rose-600/20 hover:bg-rose-600 text-rose-400 hover:text-white border border-rose-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">SELL</button>
@@ -421,7 +571,7 @@ async def get_dashboard():
                     }));
                 }
             });
-            alert("บันทึกและเชื่อมต่อ API Keys เรียบร้อยแล้ว!");
+            showToast("บันทึกและส่ง API Keys ไปยังเซิร์ฟเวอร์แล้ว", "success");
             toggleSettings();
         }
 
@@ -450,7 +600,9 @@ async def get_dashboard():
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                if (data.exchange) {
+                if (data.type === "order_result") {
+                    handleOrderFeedback(data);
+                } else if (data.exchange) {
                     exchangeData[data.exchange] = data;
                     renderExchange(data.exchange);
                     updateTotalBalance();
@@ -465,10 +617,40 @@ async def get_dashboard():
             };
         }
 
+        function handleOrderFeedback(data) {
+            const res = data.result;
+            const isSuccess = res.status === "success";
+            
+            showToast(res.message, isSuccess ? "success" : "error");
+
+            const emptyRow = document.getElementById('empty-history-row');
+            if (emptyRow) emptyRow.remove();
+
+            const tbody = document.getElementById('order-history-body');
+            const now = new Date().toLocaleTimeString();
+            const pDecimals = data.symbol.includes('VELO') ? 4 : 2;
+            
+            const row = document.createElement('tr');
+            row.className = isSuccess ? "bg-emerald-950/20" : "bg-rose-950/20";
+            
+            row.innerHTML = `
+                <td class="p-2.5 text-slate-400">${now}</td>
+                <td class="p-2.5 font-semibold text-white">${data.exchange.toUpperCase()}</td>
+                <td class="p-2.5 font-bold text-cyan-400">${data.symbol}</td>
+                <td class="p-2.5 font-bold ${data.side_type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}">${data.side_type}</td>
+                <td class="p-2.5 font-bold uppercase text-amber-400">${data.order_category}</td>
+                <td class="p-2.5 font-mono text-cyan-400">$${Number(data.amount_usdt).toLocaleString('en-US')}</td>
+                <td class="p-2.5 font-mono text-slate-300">${Number(data.price).toFixed(pDecimals)}</td>
+                <td class="p-2.5 font-semibold ${isSuccess ? 'text-emerald-400' : 'text-rose-400'}">
+                    ${isSuccess ? `✅ EXECUTED (${res.order_id || 'SUCCESS'})` : `❌ FAILED: ${res.message}`}
+                </td>
+            `;
+            tbody.prepend(row);
+        }
+
         function renderExchange(ex) {
             const item = exchangeData[ex];
             
-            // Order Book Rendering
             if (item.asks && item.asks.length > 0) {
                 let asksHTML = '';
                 const sortedAsks = [...item.asks].reverse();
@@ -498,7 +680,6 @@ async def get_dashboard():
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(pDecimals);
             }
 
-            // Balance Card Rendering (แยกเฉพาะกระดาน)
             const bCard = document.getElementById(`balance-${ex}`);
             if (bCard) {
                 if (item.is_live && item.balance) {
@@ -596,39 +777,55 @@ async def get_dashboard():
 
         let selectedEx = '';
         let selectedType = '';
+        let selectedCategory = 'market';
         let selectedAmount = 0;
+        let selectedPrice = 0;
 
         function openOrderModal(exchange, type) {
             const currentItem = exchangeData[exchange];
             if (!currentItem || !currentItem.is_live) {
-                alert(`กรุณาใส่ API Key ของ ${exchange.toUpperCase()} ก่อนส่งคำสั่งซื้อขาย`);
+                showToast(`กรุณาใส่ API Key ของ ${exchange.toUpperCase()} ก่อนส่งคำสั่งซื้อขาย`, 'error');
                 return;
             }
 
             selectedEx = exchange;
             selectedType = type;
+            
+            const categoryElem = document.getElementById(`${exchange}-ord-type`);
+            selectedCategory = categoryElem ? categoryElem.value : 'market';
+
             const amountInput = document.getElementById(`${exchange}-amount`);
             selectedAmount = amountInput ? parseFloat(amountInput.value) || 0 : 0;
 
             if (selectedAmount <= 0) {
-                alert("กรุณาระบุจำนวนเงินที่ต้องการซื้อขายให้ถูกต้อง");
+                showToast("กรุณาระบุจำนวนเงินที่ต้องการซื้อขายให้ถูกต้อง", "error");
                 return;
             }
 
-            document.getElementById('modal-exchange').innerText = exchange.toUpperCase();
-            document.getElementById('modal-symbol').innerText = currentSelectedSymbol;
-            document.getElementById('modal-type').innerText = type;
-            document.getElementById('modal-type').className = `font-semibold ${type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`;
-            document.getElementById('modal-amount').innerText = `$${selectedAmount.toLocaleString('en-US')} USDT`;
-            
+            // กำหนดราคาอ้างอิง
             let refPrice = '0.00';
             if (currentItem && currentItem.asks && currentItem.bids) {
                 if (type === 'BUY' && currentItem.asks.length > 0) refPrice = currentItem.asks[0][0];
                 if (type === 'SELL' && currentItem.bids.length > 0) refPrice = currentItem.bids[0][0];
             }
 
+            if (selectedCategory === 'limit') {
+                const limitInput = document.getElementById(`${exchange}-limit-price`);
+                selectedPrice = (limitInput && parseFloat(limitInput.value) > 0) ? parseFloat(limitInput.value) : parseFloat(refPrice);
+            } else {
+                selectedPrice = parseFloat(refPrice);
+            }
+
             const pDecimals = currentSelectedSymbol.includes('VELO') ? 4 : 2;
-            document.getElementById('modal-price').innerText = Number(refPrice).toFixed(pDecimals) + " USDT";
+
+            document.getElementById('modal-exchange').innerText = exchange.toUpperCase();
+            document.getElementById('modal-symbol').innerText = currentSelectedSymbol;
+            document.getElementById('modal-type').innerText = type;
+            document.getElementById('modal-type').className = `font-semibold ${type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`;
+            document.getElementById('modal-category').innerText = selectedCategory.toUpperCase();
+            document.getElementById('modal-amount').innerText = `$${selectedAmount.toLocaleString('en-US')} USDT`;
+            document.getElementById('modal-price').innerText = Number(selectedPrice).toFixed(pDecimals) + " USDT";
+            
             document.getElementById('order-modal').classList.remove('hidden');
             document.getElementById('order-modal').classList.add('flex');
         }
@@ -639,40 +836,17 @@ async def get_dashboard():
         }
 
         function confirmOrder() {
-            const currentItem = exchangeData[selectedEx];
-            let refPrice = '0.00';
-            if (currentItem && currentItem.asks && currentItem.bids) {
-                if (selectedType === 'BUY' && currentItem.asks.length > 0) refPrice = currentItem.asks[0][0];
-                if (selectedType === 'SELL' && currentItem.bids.length > 0) refPrice = currentItem.bids[0][0];
-            }
-
             ws.send(JSON.stringify({ 
                 action: "place_order", 
                 exchange: selectedEx, 
                 type: selectedType, 
+                order_category: selectedCategory,
                 symbol: currentSelectedSymbol,
                 amount_usdt: selectedAmount,
-                price: refPrice
+                price: selectedPrice
             }));
 
-            const tbody = document.getElementById('order-history-body');
-            if(tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
-            
-            const now = new Date().toLocaleTimeString();
-            const pDecimals = currentSelectedSymbol.includes('VELO') ? 4 : 2;
-            const row = document.createElement('tr');
-            row.innerHTML = `
-                <td class="p-2.5 text-slate-400">${now}</td>
-                <td class="p-2.5 font-semibold text-white">${selectedEx.toUpperCase()}</td>
-                <td class="p-2.5 font-bold text-cyan-400">${currentSelectedSymbol}</td>
-                <td class="p-2.5 font-bold ${selectedType === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}">${selectedType}</td>
-                <td class="p-2.5 font-mono text-cyan-400">$${selectedAmount.toLocaleString('en-US')}</td>
-                <td class="p-2.5 font-mono text-slate-300">${Number(refPrice).toFixed(pDecimals)}</td>
-                <td class="p-2.5 text-emerald-400">Success (API Sent)</td>
-            `;
-            tbody.prepend(row);
-
-            alert(`ส่งคำสั่ง ${selectedType} คู่ ${currentSelectedSymbol} จำนวน $${selectedAmount} USDT ไปยัง ${selectedEx.toUpperCase()} เรียบร้อยแล้ว!`);
+            showToast(`กำลังส่งคำสั่ง ${selectedCategory.toUpperCase()} ไปยัง ${selectedEx.toUpperCase()}...`, 'success');
             closeModal();
         }
 
