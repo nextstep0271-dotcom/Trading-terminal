@@ -53,7 +53,9 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
             config['password'] = password
 
     exchange = exchange_class(config)
-    base_asset, quote_asset = symbol.split('/') if '/' in symbol else ('BTC', 'USDT')
+
+    counter = 0
+    cached_balances = {}
 
     while True:
         try:
@@ -65,31 +67,59 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
             except Exception as ex_ob:
                 print(f"[{exchange_id}] Orderbook fetch error: {ex_ob}")
 
-            pair_balances = None
-            if has_credentials:
+            # ดึง Balance และคำนวณมูลค่าทุก Asset ทุกๆ 10 รอบ เพื่อป้องกัน Rate Limit
+            if has_credentials and (counter % 10 == 0 or not cached_balances):
                 try:
                     bal = await exchange.fetch_balance()
-                    pair_balances = {
-                        quote_asset: float(bal['total'].get(quote_asset, 0.0)),
-                        base_asset: float(bal['total'].get(base_asset, 0.0))
-                    }
+                    total_bal = bal.get('total', {})
+                    non_zero = {k: float(v) for k, v in total_bal.items() if float(v) > 0.0}
+
+                    # ดึงราคากลาง (Tickers) เพื่อแปลงทุก Asset เป็น USDT
+                    try:
+                        tickers = await exchange.fetch_tickers()
+                    except:
+                        tickers = {}
+
+                    asset_breakdown = {}
+                    for asset, amount in non_zero.items():
+                        if asset in ['USDT', 'USDC', 'BUSD', 'USD']:
+                            val_usdt = amount
+                        else:
+                            ticker_symbol = f"{asset}/USDT"
+                            price = 0.0
+                            if ticker_symbol in tickers:
+                                price = float(tickers[ticker_symbol].get('last') or tickers[ticker_symbol].get('close') or 0.0)
+                            else:
+                                try:
+                                    t = await exchange.fetch_ticker(ticker_symbol)
+                                    price = float(t.get('last') or 0.0)
+                                except:
+                                    price = 0.0
+                            val_usdt = amount * price
+
+                        asset_breakdown[asset] = {
+                            "amount": amount,
+                            "usdt_value": val_usdt
+                        }
+
+                    cached_balances = asset_breakdown
                 except Exception as ex:
-                    print(f"[{exchange_id}] Balance fetch error: {ex}")
-                    pair_balances = {quote_asset: 0.0, base_asset: 0.0}
+                    print(f"[{exchange_id}] Balance/Ticker fetch error: {ex}")
+
+            counter += 1
 
             payload = {
                 "type": "market_data",
                 "exchange": exchange_id,
                 "symbol": symbol,
-                "base_asset": base_asset,
-                "quote_asset": quote_asset,
                 "bids": orderbook['bids'],
                 "asks": orderbook['asks'],
-                "balance": pair_balances,
+                "all_assets": cached_balances if has_credentials else {},
                 "is_live": has_credentials
             }
 
             await manager.broadcast(payload)
+            await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             try:
@@ -126,10 +156,6 @@ def change_all_exchanges_symbol(symbol):
         start_or_restart_exchange(ex, symbol)
 
 async def execute_live_order(exchange_id, side_type, order_category, symbol, amount_usdt, price):
-    """
-    side_type: 'BUY' หรือ 'SELL'
-    order_category: 'market' หรือ 'limit'
-    """
     keys = exchange_keys_store.get(exchange_id) or {}
     env_key = os.getenv(f"{exchange_id.upper()}_API_KEY", '')
     env_sec = os.getenv(f"{exchange_id.upper()}_SECRET", '')
@@ -159,10 +185,9 @@ async def execute_live_order(exchange_id, side_type, order_category, symbol, amo
         
         target_price = float(price) if price and float(price) > 0 else 1.0
         amount_coin = float(amount_usdt) / target_price
-        side = side_type.lower() # 'buy' หรือ 'sell'
-        ord_type = order_category.lower() # 'market' หรือ 'limit'
+        side = side_type.lower()
+        ord_type = order_category.lower()
 
-        # ส่งคำสั่งซื้อขายไปยัง Exchange จริง
         if ord_type == 'limit':
             order_res = await exchange.create_order(
                 symbol=symbol,
@@ -227,8 +252,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif req.get("action") == "place_order":
                 ex_id = req["exchange"]
-                side_type = req["type"] # BUY / SELL
-                order_category = req.get("order_category", "market") # market / limit
+                side_type = req["type"]
+                order_category = req.get("order_category", "market")
                 symbol = req["symbol"]
                 amount_usdt = req["amount_usdt"]
                 price = req["price"]
@@ -280,7 +305,7 @@ async def get_dashboard():
                     Multi-Exchange Live Trading Terminal
                 </h1>
                 <div class="flex items-center gap-2 mt-2">
-                    <span class="text-xs text-slate-400">เลือกคู่เทรด:</span>
+                    <span class="text-xs text-slate-400">เลือกคู่เทรดหลักสำหรับ Order Book:</span>
                     <select id="symbol-select" onchange="onSymbolChange()" class="bg-slate-900 border border-cyan-500/50 text-cyan-300 font-bold text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:border-cyan-400 cursor-pointer">
                         <option value="BTC/USDT" selected>BTC / USDT</option>
                         <option value="ETH/USDT">ETH / USDT</option>
@@ -303,7 +328,7 @@ async def get_dashboard():
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span>🔑 ตั้งค่า API Keys สำหรับเชื่อมต่อแต่ละ Exchange</span>
             </h3>
-            <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดานเพื่อให้ระบบดึงข้อมูลพอร์ตและส่งคำสั่งซื้อขายจริง (ข้อมูลจะถูกบันทึกเฉพาะในเบราว์เซอร์ของคุณ)</p>
+            <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดานเพื่อให้ระบบดึงข้อมูลพอร์ตทุก Asset และส่งคำสั่งซื้อขายจริง</p>
             
             <div class="grid grid-cols-1 md:grid-cols-5 gap-4" id="api-inputs-container"></div>
             <div class="flex justify-end gap-3 pt-2">
@@ -312,18 +337,18 @@ async def get_dashboard():
             </div>
         </div>
 
-        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน -->
-        <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg">
-            <div class="flex justify-between items-center mb-3">
+        <!-- 1. ภาพรวมพอร์ตทรัพย์สิน (รวมทุก Asset ทุก Exchange + % สัดส่วน) -->
+        <section class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4 backdrop-blur-md shadow-lg space-y-4">
+            <div class="flex justify-between items-center">
                 <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                     <span class="w-2 h-2 bg-cyan-400 rounded-full"></span> 
-                    1. สรุปมูลค่าทรัพย์สินแยกรายกระดานและพอร์ตรวม (<span id="balance-pair-title" class="text-cyan-400 font-bold">BTC/USDT</span>)
+                    1. ทรัพย์สินทั้งหมดในบัญชีรายกระดานและพอร์ตรวมทุก Asset
                 </h2>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3" id="balance-container"></div>
         </section>
 
-        <!-- 2. Order Book 5 ชั้นราคา พร้อมเมนูสั่งซื้อขาย (Market / Limit) -->
+        <!-- 2. Order Book 5 ชั้นราคา -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <span class="w-2 h-2 bg-emerald-400 rounded-full"></span> 
@@ -435,7 +460,7 @@ async def get_dashboard():
 
             exchanges.forEach(ex => {
                 const exName = ex.toUpperCase();
-                exchangeData[ex] = { bids: [], asks: [], balance: null, base_asset: 'BTC', quote_asset: 'USDT', is_live: false };
+                exchangeData[ex] = { bids: [], asks: [], all_assets: null, is_live: false };
 
                 const savedKey = localStorage.getItem(`${ex}_apiKey`) || '';
                 const savedSec = localStorage.getItem(`${ex}_secret`) || '';
@@ -459,7 +484,7 @@ async def get_dashboard():
                         <span class="text-xs font-bold text-slate-400">${exName}</span>
                         <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
                     </div>
-                    <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อแสดงยอดพอร์ต</div>
+                    <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลทุก Asset</div>
                 `;
                 balanceContainer.appendChild(bCard);
 
@@ -482,7 +507,6 @@ async def get_dashboard():
                         </div>
                     </div>
 
-                    <!-- Action Control Panel -->
                     <div class="space-y-2 pt-2 border-t border-slate-800/60">
                         <div class="flex gap-2">
                             <select id="${ex}-ord-type" onchange="toggleOrderType('${ex}')" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-amber-400 font-semibold w-full focus:outline-none focus:border-cyan-500 cursor-pointer">
@@ -519,10 +543,11 @@ async def get_dashboard():
                 <div>
                     <div class="text-xs font-bold text-cyan-400 mb-1 flex justify-between items-center">
                         <span>TOTAL PORTFOLIO</span>
-                        <span class="text-[9px] bg-cyan-900/60 text-cyan-300 px-1.5 py-0.5 rounded border border-cyan-700/60">ALL EXCHANGES</span>
+                        <span class="text-[9px] bg-cyan-900/60 text-cyan-300 px-1.5 py-0.5 rounded border border-cyan-700/60">ALL ASSETS</span>
                     </div>
-                    <div class="text-xs text-slate-400 mt-1">CASH: <span id="total-quote" class="text-emerald-400 font-bold font-mono">$0.00 USDT</span></div>
-                    <div class="text-xs text-slate-400 mt-0.5">ASSET: <span id="total-base" class="text-cyan-300 font-bold font-mono">0.0000 BTC</span></div>
+                    <div id="total-assets-list" class="space-y-1 text-xs text-slate-300 mt-2 max-h-24 overflow-y-auto">
+                        <div class="text-slate-500">ยังไม่มีข้อมูล API ที่เชื่อมต่อ</div>
+                    </div>
                 </div>
                 <div class="pt-2 mt-2 border-t border-cyan-800/60 text-right">
                     <span class="text-[10px] text-slate-400 block uppercase tracking-wider">Net Portfolio Value</span>
@@ -535,7 +560,6 @@ async def get_dashboard():
         function onSymbolChange() {
             const selectElem = document.getElementById('symbol-select');
             currentSelectedSymbol = selectElem.value;
-            document.getElementById('balance-pair-title').innerText = currentSelectedSymbol;
 
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
@@ -605,7 +629,7 @@ async def get_dashboard():
                 } else if (data.exchange) {
                     exchangeData[data.exchange] = data;
                     renderExchange(data.exchange);
-                    updateTotalBalance();
+                    updateTotalPortfolio();
                 }
             };
 
@@ -651,6 +675,7 @@ async def get_dashboard():
         function renderExchange(ex) {
             const item = exchangeData[ex];
             
+            // Order Book Rendering
             if (item.asks && item.asks.length > 0) {
                 let asksHTML = '';
                 const sortedAsks = [...item.asks].reverse();
@@ -680,21 +705,23 @@ async def get_dashboard():
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(pDecimals);
             }
 
+            // Balance Card Rendering (แสดงทุก Asset ของกระดานนี้)
             const bCard = document.getElementById(`balance-${ex}`);
             if (bCard) {
-                if (item.is_live && item.balance) {
-                    const baseAsset = item.base_asset || 'BTC';
-                    const quoteAsset = item.quote_asset || 'USDT';
-                    const baseVal = Number(item.balance[baseAsset] || 0);
-                    const quoteVal = Number(item.balance[quoteAsset] || 0);
+                if (item.is_live && item.all_assets) {
+                    let assetsHTML = '';
+                    let exTotalUsdt = 0;
 
-                    let currentPrice = 0;
-                    if (item.asks && item.asks.length > 0) {
-                        currentPrice = Number(item.asks[0][0]);
+                    for (const [asset, data] of Object.entries(item.all_assets)) {
+                        exTotalUsdt += data.usdt_value;
+                        const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
+                        assetsHTML += `
+                            <div class="flex justify-between text-[11px]">
+                                <span class="text-slate-300 font-semibold">${asset}:</span>
+                                <span class="font-mono text-cyan-300">${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} <span class="text-slate-500 text-[10px]">(~$${data.usdt_value.toFixed(2)})</span></span>
+                            </div>
+                        `;
                     }
-                    const baseValueInUsdt = baseVal * currentPrice;
-                    const exTotalNetUsdt = quoteVal + baseValueInUsdt;
-                    const bDecimals = baseAsset === 'VELO' ? 2 : 4;
 
                     bCard.innerHTML = `
                         <div>
@@ -702,23 +729,13 @@ async def get_dashboard():
                                 <span class="text-xs font-bold text-white tracking-wide">${ex.toUpperCase()}</span>
                                 <span class="text-[9px] text-emerald-400 bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-800/80 font-semibold">LIVE API</span>
                             </div>
-                            <div class="space-y-1 text-xs">
-                                <div class="flex justify-between">
-                                    <span class="text-slate-400">${quoteAsset}:</span>
-                                    <span class="font-mono font-bold text-emerald-400">$${quoteVal.toLocaleString('en-US', {minimumFractionDigits: 2})}</span>
-                                </div>
-                                <div class="flex justify-between">
-                                    <span class="text-slate-400">${baseAsset}:</span>
-                                    <span class="font-mono text-cyan-300 font-semibold">${baseVal.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})}</span>
-                                </div>
-                                <div class="text-[10px] text-slate-500 text-right">
-                                    (≈ $${baseValueInUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT)
-                                </div>
+                            <div class="space-y-1 max-h-24 overflow-y-auto pr-1">
+                                ${assetsHTML || '<div class="text-slate-500 text-xs">ไม่พบ Asset ในบัญชี</div>'}
                             </div>
                         </div>
                         <div class="pt-2 mt-2 border-t border-slate-800/80 flex justify-between items-center">
                             <span class="text-[10px] font-bold text-slate-400">TOTAL:</span>
-                            <span class="text-xs font-bold font-mono text-cyan-400">$${exTotalNetUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT</span>
+                            <span class="text-xs font-bold font-mono text-cyan-400">$${exTotalUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT</span>
                         </div>
                     `;
                 } else {
@@ -727,50 +744,56 @@ async def get_dashboard():
                             <span class="text-xs font-bold text-slate-400">${ex.toUpperCase()}</span>
                             <span class="text-[9px] text-slate-500 font-semibold bg-slate-900 px-1 py-0.5 rounded border border-slate-800">NOT CONNECTED</span>
                         </div>
-                        <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อแสดงยอดพอร์ต</div>
+                        <div class="text-xs text-slate-500 py-3">กรุณาตั้งค่า API Key เพื่อดึงข้อมูลทุก Asset</div>
                     `;
                 }
             }
         }
 
-        function updateTotalBalance() {
-            let totalQuote = 0;
-            let totalBase = 0;
-            let totalBaseInUsdt = 0;
-            let currentBaseAsset = currentSelectedSymbol.split('/')[0];
-            let currentQuoteAsset = 'USDT';
+        function updateTotalPortfolio() {
+            let grandTotalUsdt = 0;
+            let aggregatedAssets = {};
             let liveCount = 0;
 
+            // 1. รวมยอดทุก Asset จากทุก Exchange
             Object.values(exchangeData).forEach(d => {
-                if(d.is_live && d.balance) {
+                if(d.is_live && d.all_assets) {
                     liveCount++;
-                    currentBaseAsset = d.base_asset || currentBaseAsset;
-                    currentQuoteAsset = d.quote_asset || 'USDT';
-                    const baseAmt = Number(d.balance[currentBaseAsset] || 0);
-                    totalQuote += Number(d.balance[currentQuoteAsset] || 0);
-                    totalBase += baseAmt;
-
-                    let px = 0;
-                    if(d.asks && d.asks.length > 0) px = Number(d.asks[0][0]);
-                    totalBaseInUsdt += (baseAmt * px);
+                    for (const [asset, data] of Object.entries(d.all_assets)) {
+                        if (!aggregatedAssets[asset]) {
+                            aggregatedAssets[asset] = { amount: 0, usdt_value: 0 };
+                        }
+                        aggregatedAssets[asset].amount += data.amount;
+                        aggregatedAssets[asset].usdt_value += data.usdt_value;
+                        grandTotalUsdt += data.usdt_value;
+                    }
                 }
             });
 
-            const totalQuoteElem = document.getElementById('total-quote');
-            const totalBaseElem = document.getElementById('total-base');
+            const assetsListElem = document.getElementById('total-assets-list');
             const totalNetElem = document.getElementById('total-net-val');
-            const bDecimals = currentBaseAsset === 'VELO' ? 2 : 4;
 
-            if(totalQuoteElem && totalBaseElem && totalNetElem) {
-                if (liveCount > 0) {
-                    const grandTotalNet = totalQuote + totalBaseInUsdt;
-                    totalQuoteElem.innerText = `$${totalQuote.toLocaleString('en-US', {minimumFractionDigits: 2})} ${currentQuoteAsset}`;
-                    totalBaseElem.innerHTML = `${totalBase.toLocaleString('en-US', {minimumFractionDigits: bDecimals, maximumFractionDigits: bDecimals})} ${currentBaseAsset} <span class="text-slate-400 font-normal">(≈ $${totalBaseInUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})})</span>`;
-                    totalNetElem.innerText = `$${grandTotalNet.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT`;
+            if (assetsListElem && totalNetElem) {
+                if (liveCount > 0 && grandTotalUsdt > 0) {
+                    let htmlList = '';
+                    for (const [asset, data] of Object.entries(aggregatedAssets)) {
+                        const percentage = (data.usdt_value / grandTotalUsdt) * 100;
+                        const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
+                        htmlList += `
+                            <div class="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded">
+                                <span class="font-bold text-cyan-300">${asset}:</span>
+                                <span class="font-mono text-right text-slate-300">
+                                    ${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} 
+                                    <span class="text-emerald-400 font-semibold">(${percentage.toFixed(2)}%)</span>
+                                </span>
+                            </div>
+                        `;
+                    }
+                    assetsListElem.innerHTML = htmlList;
+                    totalNetElem.innerText = `$${grandTotalUsdt.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} USDT`;
                 } else {
-                    totalQuoteElem.innerText = "$0.00 USDT";
-                    totalBaseElem.innerHTML = `0.0000 ${currentBaseAsset}`;
-                    totalNetElem.innerText = "$0.00 USDT (ยังไม่มี API)";
+                    assetsListElem.innerHTML = `<div class="text-slate-500">ยังไม่มี API ที่เชื่อมต่อข้อมูลพอร์ต</div>`;
+                    totalNetElem.innerText = "$0.00 USDT";
                 }
             }
         }
@@ -802,7 +825,6 @@ async def get_dashboard():
                 return;
             }
 
-            // กำหนดราคาอ้างอิง
             let refPrice = '0.00';
             if (currentItem && currentItem.asks && currentItem.bids) {
                 if (type === 'BUY' && currentItem.asks.length > 0) refPrice = currentItem.asks[0][0];
