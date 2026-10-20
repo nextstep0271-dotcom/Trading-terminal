@@ -30,12 +30,14 @@ manager = ConnectionManager()
 
 running_tasks = {}
 exchange_keys_store = {}
-current_symbol_store = "BTC/USDT"
+# เก็บคู่เทรดแยกรายกระดาน (OKX, Binance, KuCoin)
+exchange_symbols_store = {
+    'okx': 'BTC/USDT',
+    'binance': 'BTC/USDT',
+    'kucoin': 'BTC/USDT'
+}
 
 async def watch_exchange_data(exchange_id, symbol, api_keys=None):
-    exchange_class = getattr(ccxtpro, exchange_id)
-    config = {'enableRateLimit': True}
-    
     env_key = os.getenv(f"{exchange_id.upper()}_API_KEY", '')
     env_sec = os.getenv(f"{exchange_id.upper()}_SECRET", '')
     env_pwd = os.getenv(f"{exchange_id.upper()}_PASSWORD", '')
@@ -46,20 +48,15 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
 
     has_credentials = bool(apiKey and secret)
 
+    config = {'enableRateLimit': True}
     if has_credentials:
         config['apiKey'] = apiKey
         config['secret'] = secret
         if password:
             config['password'] = password
 
+    exchange_class = getattr(ccxtpro, exchange_id)
     exchange = exchange_class(config)
-
-    # สำหรับ Bitkub คู่เงินจะเป็น THB เสมอ เช่น BTC/THB, ETH/THB, VELO/THB
-    effective_symbol = symbol
-    if exchange_id == 'bitkub':
-        base_asset = symbol.split('/')[0] if '/' in symbol else 'BTC'
-        effective_symbol = f"{base_asset}/THB"
-
     counter = 0
     cached_balances = {}
 
@@ -67,21 +64,19 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
         try:
             orderbook = {'bids': [], 'asks': []}
             try:
-                orderbook_data = await exchange.watch_order_book(effective_symbol, limit=5)
+                orderbook_data = await exchange.watch_order_book(symbol, limit=5)
                 orderbook['bids'] = orderbook_data.get('bids', [])[:5]
                 orderbook['asks'] = orderbook_data.get('asks', [])[:5]
             except Exception as ex_ob:
-                print(f"[{exchange_id}] Orderbook fetch error: {ex_ob}")
+                print(f"[{exchange_id}] Orderbook fetch error ({symbol}): {ex_ob}")
 
-            if has_credentials and (counter % 10 == 0 or not cached_balances):
+            if has_credentials and (counter % 5 == 0 or not cached_balances):
                 try:
                     bal = await exchange.fetch_balance()
                     total_bal = bal.get('total', {})
                     
-                    # กำหนดเหรียญหลักตามกระดาน (Bitkub ใช้ THB, ที่อื่นใช้ USDT)
-                    quote_stable = 'THB' if exchange_id == 'bitkub' else 'USDT'
-                    if quote_stable not in total_bal:
-                        total_bal[quote_stable] = 0.0
+                    if 'USDT' not in total_bal:
+                        total_bal['USDT'] = 0.0
 
                     non_zero = {k: float(v) for k, v in total_bal.items() if float(v) >= 0.0}
 
@@ -90,23 +85,12 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                     except:
                         tickers = {}
 
-                    # อัตราแลกเปลี่ยนคร่าวๆ สำหรับแปลง THB เป็น USDT เพื่อรวมพอร์ต (สมมติ 1 USDT = 35 THB หรือดึงจากคู่ USDT/THB ถ้ามี)
-                    thb_to_usdt_rate = 1.0 / 35.0
-                    try:
-                        if 'USDT/THB' in tickers:
-                            usdt_thb = float(tickers['USDT/THB'].get('last') or 35.0)
-                            thb_to_usdt_rate = 1.0 / usdt_thb
-                    except:
-                        pass
-
                     asset_breakdown = {}
                     for asset, amount in non_zero.items():
                         if asset in ['USDT', 'USDC', 'BUSD', 'USD']:
                             val_usdt = amount
-                        elif asset == 'THB':
-                            val_usdt = amount * thb_to_usdt_rate
                         else:
-                            ticker_symbol = f"{asset}/{quote_stable}"
+                            ticker_symbol = f"{asset}/USDT"
                             price = 0.0
                             if ticker_symbol in tickers:
                                 price = float(tickers[ticker_symbol].get('last') or tickers[ticker_symbol].get('close') or 0.0)
@@ -116,9 +100,7 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                                     price = float(t.get('last') or 0.0)
                                 except:
                                     price = 0.0
-                            
-                            raw_val = amount * price
-                            val_usdt = raw_val * thb_to_usdt_rate if exchange_id == 'bitkub' else raw_val
+                            val_usdt = amount * price
 
                         asset_breakdown[asset] = {
                             "amount": amount,
@@ -127,14 +109,14 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
 
                     cached_balances = asset_breakdown
                 except Exception as ex:
-                    print(f"[{exchange_id}] Balance/Ticker fetch error: {ex}")
+                    print(f"[{exchange_id}] Balance fetch error: {ex}")
 
             counter += 1
 
             payload = {
                 "type": "market_data",
                 "exchange": exchange_id,
-                "symbol": effective_symbol,
+                "symbol": symbol,
                 "bids": orderbook['bids'],
                 "asks": orderbook['asks'],
                 "all_assets": cached_balances if has_credentials else {},
@@ -142,7 +124,7 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
             }
 
             await manager.broadcast(payload)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
             try:
@@ -151,18 +133,23 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                 pass
             break
         except Exception as e:
-            print(f"Error on {exchange_id} ({effective_symbol}): {e}")
-            await asyncio.sleep(5)
+            print(f"Error loop on {exchange_id} ({symbol}): {e}")
+            await asyncio.sleep(3)
             try:
                 await exchange.close()
             except:
                 pass
             exchange = exchange_class(config)
 
-def start_or_restart_exchange(exchange_id, symbol="BTC/USDT", keys=None):
+def start_or_restart_exchange(exchange_id, symbol=None, keys=None):
     if exchange_id in running_tasks and not running_tasks[exchange_id].done():
         running_tasks[exchange_id].cancel()
     
+    if symbol:
+        exchange_symbols_store[exchange_id] = symbol
+    else:
+        symbol = exchange_symbols_store.get(exchange_id, 'BTC/USDT')
+
     if keys is not None:
         exchange_keys_store[exchange_id] = keys
     else:
@@ -171,14 +158,7 @@ def start_or_restart_exchange(exchange_id, symbol="BTC/USDT", keys=None):
     task = asyncio.create_task(watch_exchange_data(exchange_id, symbol, keys))
     running_tasks[exchange_id] = task
 
-def change_all_exchanges_symbol(symbol):
-    global current_symbol_store
-    current_symbol_store = symbol
-    exchanges = ['binance', 'okx', 'bybit', 'kucoin', 'bitkub']
-    for ex in exchanges:
-        start_or_restart_exchange(ex, symbol)
-
-async def execute_live_order(exchange_id, side_type, order_category, symbol, amount_usdt, price):
+async def execute_live_order(exchange_id, side_type, order_category, symbol, amount_val, price):
     keys = exchange_keys_store.get(exchange_id) or {}
     env_key = os.getenv(f"{exchange_id.upper()}_API_KEY", '')
     env_sec = os.getenv(f"{exchange_id.upper()}_SECRET", '')
@@ -206,21 +186,14 @@ async def execute_live_order(exchange_id, side_type, order_category, symbol, amo
 
         exchange = exchange_class(config)
         
-        effective_symbol = symbol
-        if exchange_id == 'bitkub':
-            base_asset = symbol.split('/')[0] if '/' in symbol else 'BTC'
-            effective_symbol = f"{base_asset}/THB"
-            # ถ้าเป็น Bitkub จำนวนเงิน input มาเป็น USDT จะต้องแปลงเป็น THB คร่าวๆ หรือใช้ตามจำนวน
-            amount_usdt = float(amount_usdt) * 35.0 # แปลง USDT เป็น THB สำหรับส่งคำสั่ง Bitkub
-
         target_price = float(price) if price and float(price) > 0 else 1.0
-        amount_coin = float(amount_usdt) / target_price
+        amount_coin = float(amount_val) / target_price
         side = side_type.lower()
         ord_type = order_category.lower()
 
         if ord_type == 'limit':
             order_res = await exchange.create_order(
-                symbol=effective_symbol,
+                symbol=symbol,
                 type='limit',
                 side=side,
                 amount=amount_coin,
@@ -228,7 +201,7 @@ async def execute_live_order(exchange_id, side_type, order_category, symbol, amo
             )
         else:
             order_res = await exchange.create_order(
-                symbol=effective_symbol,
+                symbol=symbol,
                 type='market',
                 side=side,
                 amount=amount_coin
@@ -236,11 +209,10 @@ async def execute_live_order(exchange_id, side_type, order_category, symbol, amo
 
         await exchange.close()
 
-        currency_label = 'THB' if exchange_id == 'bitkub' else 'USDT'
         return {
             "status": "success",
             "order_id": order_res.get('id', 'N/A'),
-            "message": f"ส่งคำสั่ง {side_type} ({ord_type.upper()}) คู่ {effective_symbol} สำเร็จ!",
+            "message": f"ส่งคำสั่ง {side_type} ({ord_type.upper()}) คู่ {symbol} สำเร็จ!",
             "details": order_res
         }
 
@@ -252,7 +224,8 @@ async def execute_live_order(exchange_id, side_type, order_category, symbol, amo
 
 @app.on_event("startup")
 async def startup_event():
-    change_all_exchanges_symbol("BTC/USDT")
+    for ex, sym in exchange_symbols_store.items():
+        start_or_restart_exchange(ex, sym)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -265,7 +238,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if req.get("action") == "update_keys":
                 ex_id = req["exchange"]
                 keys = req["keys"]
-                start_or_restart_exchange(ex_id, current_symbol_store, keys)
+                start_or_restart_exchange(ex_id, exchange_symbols_store.get(ex_id), keys)
                 await websocket.send_text(json.dumps({
                     "type": "system_msg",
                     "status": "success", 
@@ -273,23 +246,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 }))
             
             elif req.get("action") == "change_symbol":
-                new_symbol = req.get("symbol", "BTC/USDT")
-                change_all_exchanges_symbol(new_symbol)
-                await websocket.send_text(json.dumps({
-                    "type": "system_msg",
-                    "status": "success", 
-                    "message": f"Switched symbol to {new_symbol}"
-                }))
+                ex_id = req.get("exchange")
+                new_symbol = req.get("symbol")
+                if ex_id and new_symbol:
+                    start_or_restart_exchange(ex_id, new_symbol)
+                    await websocket.send_text(json.dumps({
+                        "type": "system_msg",
+                        "status": "success", 
+                        "message": f"Switched {ex_id} symbol to {new_symbol}"
+                    }))
 
             elif req.get("action") == "place_order":
                 ex_id = req["exchange"]
                 side_type = req["type"]
                 order_category = req.get("order_category", "market")
                 symbol = req["symbol"]
-                amount_usdt = req["amount_usdt"]
+                amount_val = req["amount_val"]
                 price = req["price"]
 
-                result = await execute_live_order(ex_id, side_type, order_category, symbol, amount_usdt, price)
+                result = await execute_live_order(ex_id, side_type, order_category, symbol, amount_val, price)
                 
                 await websocket.send_text(json.dumps({
                     "type": "order_result",
@@ -297,7 +272,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "side_type": side_type,
                     "order_category": order_category,
                     "symbol": symbol,
-                    "amount_usdt": amount_usdt,
+                    "amount_val": amount_val,
                     "price": price,
                     "result": result
                 }))
@@ -313,7 +288,7 @@ async def get_dashboard():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Multi-Exchange Live Trading Terminal</title>
+    <title>Live Trading Terminal (OKX, Binance, KuCoin)</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -326,23 +301,16 @@ async def get_dashboard():
     <div id="toast-container" class="fixed top-5 right-5 z-50 space-y-2 w-80"></div>
 
     <div class="max-w-7xl mx-auto space-y-6">
-        <!-- Header -->
+        <!-- Header & Top Filter -->
         <header class="flex flex-col md:flex-row justify-between items-start md:items-center pb-4 border-b border-slate-800 gap-4">
             <div>
                 <h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-7 w-7 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
                     </svg>
-                    Multi-Exchange Live Trading Terminal (Binance, OKX, Bybit, KuCoin, Bitkub)
+                    Live Trading Terminal (OKX, Binance, KuCoin)
                 </h1>
-                <div class="flex items-center gap-2 mt-2">
-                    <span class="text-xs text-slate-400">เลือกคู่เทรดหลัก (Bitkub จะใช้สกุล THB อัตโนมัติ):</span>
-                    <select id="symbol-select" onchange="onSymbolChange()" class="bg-slate-900 border border-cyan-500/50 text-cyan-300 font-bold text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:border-cyan-400 cursor-pointer">
-                        <option value="BTC/USDT" selected>BTC / USDT (Bitkub: BTC/THB)</option>
-                        <option value="ETH/USDT">ETH / USDT (Bitkub: ETH/THB)</option>
-                        <option value="VELO/USDT">VELO / USDT (Bitkub: VELO/THB)</option>
-                    </select>
-                </div>
+                <p class="text-xs text-slate-400 mt-1">เลือกล็อคการแสดงผล Exchange ที่ต้องการ และเลือกคู่เทรดได้อย่างอิสระ</p>
             </div>
             <div class="flex items-center gap-3">
                 <button onclick="toggleSettings()" class="bg-cyan-600/20 hover:bg-cyan-600 text-cyan-400 hover:text-white border border-cyan-500/30 px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer">
@@ -354,14 +322,37 @@ async def get_dashboard():
             </div>
         </header>
 
+        <!-- Exchange Selection Panel (เลือก Exchange ก่อนเลือกคู่เทรด) -->
+        <section class="bg-slate-900/90 border border-cyan-500/30 rounded-xl p-4 shadow-xl flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div class="flex items-center gap-3">
+                <span class="text-xs font-bold text-cyan-300 uppercase tracking-wider flex items-center gap-1.5">
+                    📌 เลือก Exchange ที่ต้องการเทรด:
+                </span>
+                <select id="active-exchange-select" onchange="filterExchangeView()" class="bg-slate-950 border border-cyan-500/60 text-cyan-300 font-bold text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-cyan-400 cursor-pointer">
+                    <option value="all" selected>🌐 ทุก Exchange (OKX, Binance, KuCoin)</option>
+                    <option value="okx">🟧 OKX</option>
+                    <option value="binance">🟡 Binance</option>
+                    <option value="kucoin">🟢 KuCoin</option>
+                </select>
+            </div>
+
+            <!-- Tab Quick Toggle -->
+            <div class="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
+                <button onclick="setExchangeFilter('all')" id="btn-tab-all" class="px-3 py-1 text-xs font-bold rounded-md bg-cyan-600 text-white transition cursor-pointer">ALL</button>
+                <button onclick="setExchangeFilter('okx')" id="btn-tab-okx" class="px-3 py-1 text-xs font-bold rounded-md text-slate-400 hover:text-white transition cursor-pointer">OKX</button>
+                <button onclick="setExchangeFilter('binance')" id="btn-tab-binance" class="px-3 py-1 text-xs font-bold rounded-md text-slate-400 hover:text-white transition cursor-pointer">BINANCE</button>
+                <button onclick="setExchangeFilter('kucoin')" id="btn-tab-kucoin" class="px-3 py-1 text-xs font-bold rounded-md text-slate-400 hover:text-white transition cursor-pointer">KUCOIN</button>
+            </div>
+        </section>
+
         <!-- API Configuration Panel -->
         <div id="settings-panel" class="bg-slate-900 border border-cyan-500/30 rounded-xl p-5 hidden shadow-2xl space-y-4">
             <h3 class="text-base font-bold text-white flex items-center gap-2">
                 <span>🔑 ตั้งค่า API Keys สำหรับเชื่อมต่อแต่ละ Exchange</span>
             </h3>
-            <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดาน (รวมถึง Bitkub)</p>
+            <p class="text-xs text-slate-400">กรอก API Key และ Secret ของแต่ละกระดาน (OKX ต้องการ Passphrase)</p>
             
-            <div class="grid grid-cols-1 md:grid-cols-5 gap-4" id="api-inputs-container"></div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4" id="api-inputs-container"></div>
             <div class="flex justify-end gap-3 pt-2">
                 <button onclick="toggleSettings()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer">ปิด</button>
                 <button onclick="saveApiKeys()" class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-2 rounded-lg text-xs font-medium cursor-pointer shadow-lg">บันทึกและเชื่อมต่อ API</button>
@@ -373,19 +364,19 @@ async def get_dashboard():
             <div class="flex justify-between items-center">
                 <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                     <span class="w-2 h-2 bg-cyan-400 rounded-full"></span> 
-                    1. ทรัพย์สินทั้งหมด (รวม THB/USDT และทุก Asset พร้อมสัดส่วน %)
+                    1. ทรัพย์สินทั้งหมดในพอร์ต (รวม USDT และทุก Asset พร้อมสัดส่วน %)
                 </h2>
             </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3" id="balance-container"></div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3" id="balance-container"></div>
         </section>
 
-        <!-- 2. Order Book 5 ชั้นราคา -->
+        <!-- 2. Order Book 5 ชั้นราคา พร้อมเมนูเลือกคู่เทรดรายกระดาน -->
         <section class="space-y-3">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <span class="w-2 h-2 bg-emerald-400 rounded-full"></span> 
-                2. Order Book 5 ชั้นราคาและพาเนลส่งคำสั่ง
+                2. Order Book 5 ชั้นราคาและพาเนลส่งคำสั่ง (เลือกคู่เทรดราย Exchange)
             </h2>
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4" id="exchange-container"></div>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="exchange-container"></div>
         </section>
 
         <!-- 3. ตารางประวัติการส่งคำสั่ง -->
@@ -403,7 +394,7 @@ async def get_dashboard():
                             <th class="p-2.5">คู่เทรด</th>
                             <th class="p-2.5">ประเภท</th>
                             <th class="p-2.5">โหมด</th>
-                            <th class="p-2.5">จำนวน</th>
+                            <th class="p-2.5">จำนวน (USDT)</th>
                             <th class="p-2.5">ราคา</th>
                             <th class="p-2.5">สถานะจาก Exchange</th>
                         </tr>
@@ -436,10 +427,16 @@ async def get_dashboard():
     </div>
 
     <script>
-        const exchanges = ['binance', 'okx', 'bybit', 'kucoin', 'bitkub'];
+        const exchanges = ['okx', 'binance', 'kucoin'];
+        const exchangeSymbols = {
+            'okx': ['BTC/USDT', 'ETH/USDT', 'VELO/USDT'],
+            'binance': ['BTC/USDT', 'ETH/USDT', 'VELO/USDT'],
+            'kucoin': ['BTC/USDT', 'ETH/USDT', 'VELO/USDT']
+        };
+
         const exchangeData = {};
         let ws;
-        let currentSelectedSymbol = "BTC/USDT";
+        let currentFilter = 'all';
 
         function showToast(message, type = 'success') {
             const container = document.getElementById('toast-container');
@@ -468,6 +465,42 @@ async def get_dashboard():
             }, 5000);
         }
 
+        function filterExchangeView() {
+            const selectElem = document.getElementById('active-exchange-select');
+            setExchangeFilter(selectElem.value);
+        }
+
+        function setExchangeFilter(ex) {
+            currentFilter = ex;
+            document.getElementById('active-exchange-select').value = ex;
+
+            // อัปเดตสีปุ่ม Tab
+            ['all', 'okx', 'binance', 'kucoin'].forEach(t => {
+                const btn = document.getElementById(`btn-tab-${t}`);
+                if (btn) {
+                    if (t === ex) {
+                        btn.className = "px-3 py-1 text-xs font-bold rounded-md bg-cyan-600 text-white transition cursor-pointer";
+                    } else {
+                        btn.className = "px-3 py-1 text-xs font-bold rounded-md text-slate-400 hover:text-white transition cursor-pointer";
+                    }
+                }
+            });
+
+            // แสดง/ซ่อน การ์ด Exchange ตามการเลือก
+            exchanges.forEach(e => {
+                const exCard = document.getElementById(`card-ex-${e}`);
+                const balCard = document.getElementById(`balance-${e}`);
+                
+                if (ex === 'all' || ex === e) {
+                    if (exCard) exCard.classList.remove('hidden');
+                    if (balCard) balCard.classList.remove('hidden');
+                } else {
+                    if (exCard) exCard.classList.add('hidden');
+                    if (balCard) balCard.classList.add('hidden');
+                }
+            });
+        }
+
         function toggleOrderType(ex) {
             const typeSelect = document.getElementById(`${ex}-ord-type`);
             const priceContainer = document.getElementById(`${ex}-price-container`);
@@ -477,6 +510,18 @@ async def get_dashboard():
                 } else {
                     priceContainer.classList.add('hidden');
                 }
+            }
+        }
+
+        function onExSymbolChange(ex) {
+            const selectElem = document.getElementById(`${ex}-symbol-select`);
+            if (selectElem && ws && ws.readyState === WebSocket.OPEN) {
+                const newSymbol = selectElem.value;
+                ws.send(JSON.stringify({
+                    action: "change_symbol",
+                    exchange: ex,
+                    symbol: newSymbol
+                }));
             }
         }
 
@@ -491,7 +536,7 @@ async def get_dashboard():
 
             exchanges.forEach(ex => {
                 const exName = ex.toUpperCase();
-                exchangeData[ex] = { bids: [], asks: [], all_assets: null, is_live: false };
+                exchangeData[ex] = { bids: [], asks: [], all_assets: null, is_live: false, symbol: exchangeSymbols[ex][0] };
 
                 const savedKey = localStorage.getItem(`${ex}_apiKey`) || '';
                 const savedSec = localStorage.getItem(`${ex}_secret`) || '';
@@ -519,13 +564,21 @@ async def get_dashboard():
                 `;
                 balanceContainer.appendChild(bCard);
 
+                let symOptionsHTML = '';
+                exchangeSymbols[ex].forEach(sym => {
+                    symOptionsHTML += `<option value="${sym}">${sym}</option>`;
+                });
+
                 const card = document.createElement('div');
+                card.id = `card-ex-${ex}`;
                 card.className = 'bg-slate-900/80 border border-slate-800/80 rounded-xl p-4 flex flex-col justify-between shadow-xl backdrop-blur-md';
                 card.innerHTML = `
                     <div>
                         <div class="flex justify-between items-center mb-3">
                             <span class="font-bold text-base text-white tracking-wide">${exName}</span>
-                            <span class="text-[10px] uppercase font-semibold px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700/50">${ex === 'bitkub' ? 'THB Pair' : 'Spot'}</span>
+                            <select id="${ex}-symbol-select" onchange="onExSymbolChange('${ex}')" class="bg-slate-950 border border-cyan-500/40 text-cyan-300 font-bold text-[11px] rounded px-2 py-0.5 focus:outline-none cursor-pointer">
+                                ${symOptionsHTML}
+                            </select>
                         </div>
                         <div class="space-y-1 mb-2" id="${ex}-asks">
                             <div class="text-xs text-slate-500 text-center py-4">Waiting for connection...</div>
@@ -549,7 +602,7 @@ async def get_dashboard():
                         <div class="relative">
                             <input type="number" id="${ex}-amount" placeholder="จำนวนเงิน" value="100" min="1" step="10"
                                 class="w-full bg-slate-950 border border-slate-700/80 rounded-lg px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-cyan-500 transition pr-12">
-                            <span class="absolute right-3 top-1.5 text-[11px] font-bold text-slate-400">${ex === 'bitkub' ? 'THB' : 'USDT'}</span>
+                            <span class="absolute right-3 top-1.5 text-[11px] font-bold text-slate-400">USDT</span>
                         </div>
 
                         <div id="${ex}-price-container" class="relative hidden">
@@ -586,18 +639,6 @@ async def get_dashboard():
                 </div>
             `;
             balanceContainer.appendChild(totalCard);
-        }
-
-        function onSymbolChange() {
-            const selectElem = document.getElementById('symbol-select');
-            currentSelectedSymbol = selectElem.value;
-
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    action: "change_symbol",
-                    symbol: currentSelectedSymbol
-                }));
-            }
         }
 
         function toggleSettings() {
@@ -694,7 +735,7 @@ async def get_dashboard():
                 <td class="p-2.5 font-bold text-cyan-400">${data.symbol}</td>
                 <td class="p-2.5 font-bold ${data.side_type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}">${data.side_type}</td>
                 <td class="p-2.5 font-bold uppercase text-amber-400">${data.order_category}</td>
-                <td class="p-2.5 font-mono text-cyan-400">${data.exchange === 'bitkub' ? '฿' : '$'}${Number(data.amount_usdt).toLocaleString('en-US')}</td>
+                <td class="p-2.5 font-mono text-cyan-400">$${Number(data.amount_val).toLocaleString('en-US')}</td>
                 <td class="p-2.5 font-mono text-slate-300">${Number(data.price).toFixed(pDecimals)}</td>
                 <td class="p-2.5 font-semibold ${isSuccess ? 'text-emerald-400' : 'text-rose-400'}">
                     ${isSuccess ? `✅ EXECUTED (${res.order_id || 'SUCCESS'})` : `❌ FAILED: ${res.message}`}
@@ -705,7 +746,6 @@ async def get_dashboard():
 
         function renderExchange(ex) {
             const item = exchangeData[ex];
-            const isBitkub = ex === 'bitkub';
             
             if (item.asks && item.asks.length > 0) {
                 let asksHTML = '';
@@ -749,12 +789,11 @@ async def get_dashboard():
                     for (const [asset, data] of Object.entries(item.all_assets)) {
                         const percentage = exTotalUsdt > 0 ? (data.usdt_value / exTotalUsdt) * 100 : 0;
                         const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
-                        const prefix = (isBitkub && asset === 'THB') ? '฿' : '';
                         assetsHTML += `
                             <div class="flex justify-between items-center text-[11px] py-0.5 border-b border-slate-800/40">
                                 <span class="text-slate-300 font-semibold">${asset}:</span>
                                 <span class="font-mono text-right text-cyan-300">
-                                    ${prefix}${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} 
+                                    ${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} 
                                     <span class="text-emerald-400 text-[10px]">(${percentage.toFixed(1)}%)</span>
                                 </span>
                             </div>
@@ -816,12 +855,11 @@ async def get_dashboard():
                     for (const [asset, data] of Object.entries(aggregatedAssets)) {
                         const percentage = grandTotalUsdt > 0 ? (data.usdt_value / grandTotalUsdt) * 100 : 0;
                         const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
-                        const prefix = asset === 'THB' ? '฿' : '';
                         htmlList += `
                             <div class="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded">
                                 <span class="font-bold text-cyan-300">${asset}:</span>
                                 <span class="font-mono text-right text-slate-300">
-                                    ${prefix}${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} 
+                                    ${data.amount.toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec})} 
                                     <span class="text-emerald-400 font-semibold">(${percentage.toFixed(2)}%)</span>
                                 </span>
                             </div>
@@ -877,15 +915,14 @@ async def get_dashboard():
             }
 
             const pDecimals = currentItem.symbol.includes('VELO') ? 4 : 2;
-            const currencyLabel = exchange === 'bitkub' ? 'THB' : 'USDT';
 
             document.getElementById('modal-exchange').innerText = exchange.toUpperCase();
             document.getElementById('modal-symbol').innerText = currentItem.symbol;
             document.getElementById('modal-type').innerText = type;
             document.getElementById('modal-type').className = `font-semibold ${type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`;
             document.getElementById('modal-category').innerText = selectedCategory.toUpperCase();
-            document.getElementById('modal-amount').innerText = `${exchange === 'bitkub' ? '฿' : '$'}${selectedAmount.toLocaleString('en-US')} ${currencyLabel}`;
-            document.getElementById('modal-price').innerText = Number(selectedPrice).toFixed(pDecimals) + ` ${currencyLabel}`;
+            document.getElementById('modal-amount').innerText = `$${selectedAmount.toLocaleString('en-US')} USDT`;
+            document.getElementById('modal-price').innerText = Number(selectedPrice).toFixed(pDecimals) + " USDT";
             
             document.getElementById('order-modal').classList.remove('hidden');
             document.getElementById('order-modal').classList.add('flex');
@@ -897,13 +934,14 @@ async def get_dashboard():
         }
 
         function confirmOrder() {
+            const currentItem = exchangeData[selectedEx];
             ws.send(JSON.stringify({ 
                 action: "place_order", 
                 exchange: selectedEx, 
                 type: selectedType, 
                 order_category: selectedCategory,
-                symbol: currentSelectedSymbol,
-                amount_usdt: selectedAmount,
+                symbol: currentItem.symbol,
+                amount_val: selectedAmount,
                 price: selectedPrice
             }));
 
