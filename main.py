@@ -34,7 +34,7 @@ exchange_keys_store = {}
 exchange_symbols_store = {
     'okx': 'BTC/USDT',
     'binance': 'BTC/USDT',
-    'kucoin': 'BTC/USDT'
+    'kucoin': 'SOXL/USDT:USDT'  # Default เป็น KuCoin Futures SOXL Perpetual
 }
 
 async def watch_exchange_data(exchange_id, symbol, api_keys=None):
@@ -90,16 +90,26 @@ async def watch_exchange_data(exchange_id, symbol, api_keys=None):
                         if asset in ['USDT', 'USDC', 'BUSD', 'USD']:
                             val_usdt = amount
                         else:
+                            # คำนวณราคาสำหรับ Asset ทั้งแบบ Spot และ Perpetual
                             ticker_symbol = f"{asset}/USDT"
+                            perp_symbol = f"{asset}/USDT:USDT"
                             price = 0.0
+                            
                             if ticker_symbol in tickers:
                                 price = float(tickers[ticker_symbol].get('last') or tickers[ticker_symbol].get('close') or 0.0)
+                            elif perp_symbol in tickers:
+                                price = float(tickers[perp_symbol].get('last') or tickers[perp_symbol].get('close') or 0.0)
                             else:
                                 try:
                                     t = await exchange.fetch_ticker(ticker_symbol)
                                     price = float(t.get('last') or 0.0)
                                 except:
-                                    price = 0.0
+                                    try:
+                                        t = await exchange.fetch_ticker(perp_symbol)
+                                        price = float(t.get('last') or 0.0)
+                                    except:
+                                        price = 0.0
+                                        
                             val_usdt = amount * price
 
                         asset_breakdown[asset] = {
@@ -288,7 +298,7 @@ async def get_dashboard():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Trading Terminal (OKX, Binance, KuCoin)</title>
+    <title>Live Trading Terminal (OKX, Binance, KuCoin Futures)</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -310,7 +320,7 @@ async def get_dashboard():
                     </svg>
                     Live Trading Terminal (OKX, Binance, KuCoin)
                 </h1>
-                <p class="text-xs text-slate-400 mt-1">เลือกล็อคการแสดงผล Exchange ที่ต้องการ และเลือกคู่เทรดได้อย่างอิสระ</p>
+                <p class="text-xs text-slate-400 mt-1">รองรับสัญญา Futures Perpetual (SOXL/USDT:USDT) บน KuCoin</p>
             </div>
             <div class="flex items-center gap-3">
                 <button onclick="toggleSettings()" class="bg-cyan-600/20 hover:bg-cyan-600 text-cyan-400 hover:text-white border border-cyan-500/30 px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer">
@@ -322,7 +332,7 @@ async def get_dashboard():
             </div>
         </header>
 
-        <!-- Exchange Selection Panel (เลือก Exchange ก่อนเลือกคู่เทรด) -->
+        <!-- Exchange Selection Panel -->
         <section class="bg-slate-900/90 border border-cyan-500/30 rounded-xl p-4 shadow-xl flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
             <div class="flex items-center gap-3">
                 <span class="text-xs font-bold text-cyan-300 uppercase tracking-wider flex items-center gap-1.5">
@@ -332,7 +342,7 @@ async def get_dashboard():
                     <option value="all" selected>🌐 ทุก Exchange (OKX, Binance, KuCoin)</option>
                     <option value="okx">🟧 OKX</option>
                     <option value="binance">🟡 Binance</option>
-                    <option value="kucoin">🟢 KuCoin</option>
+                    <option value="kucoin">🟢 KuCoin (Futures Available)</option>
                 </select>
             </div>
 
@@ -374,7 +384,7 @@ async def get_dashboard():
         <section class="space-y-3">
             <h2 class="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-2">
                 <span class="w-2 h-2 bg-emerald-400 rounded-full"></span> 
-                2. Order Book 5 ชั้นราคาและพาเนลส่งคำสั่ง (เลือกคู่เทรดราย Exchange)
+                2. Order Book 5 ชั้นราคาและพาเนลส่งคำสั่ง (รองรับ Futures SOXL Perpetual บน KuCoin)
             </h2>
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="exchange-container"></div>
         </section>
@@ -431,7 +441,7 @@ async def get_dashboard():
         const exchangeSymbols = {
             'okx': ['BTC/USDT', 'ETH/USDT', 'VELO/USDT'],
             'binance': ['BTC/USDT', 'ETH/USDT', 'VELO/USDT'],
-            'kucoin': ['BTC/USDT', 'ETH/USDT', 'VELO/USDT']
+            'kucoin': ['SOXL/USDT:USDT', 'BTC/USDT', 'ETH/USDT', 'VELO/USDT'] // เพิ่ม KuCoin Futures SOXL Perpetual
         };
 
         const exchangeData = {};
@@ -474,7 +484,6 @@ async def get_dashboard():
             currentFilter = ex;
             document.getElementById('active-exchange-select').value = ex;
 
-            // อัปเดตสีปุ่ม Tab
             ['all', 'okx', 'binance', 'kucoin'].forEach(t => {
                 const btn = document.getElementById(`btn-tab-${t}`);
                 if (btn) {
@@ -486,7 +495,6 @@ async def get_dashboard():
                 }
             });
 
-            // แสดง/ซ่อน การ์ด Exchange ตามการเลือก
             exchanges.forEach(e => {
                 const exCard = document.getElementById(`card-ex-${e}`);
                 const balCard = document.getElementById(`balance-${e}`);
@@ -566,7 +574,8 @@ async def get_dashboard():
 
                 let symOptionsHTML = '';
                 exchangeSymbols[ex].forEach(sym => {
-                    symOptionsHTML += `<option value="${sym}">${sym}</option>`;
+                    const label = sym.includes(':') ? `${sym.split('/')[0]} Perpetual (Futures)` : sym;
+                    symOptionsHTML += `<option value="${sym}">${label}</option>`;
                 });
 
                 const card = document.createElement('div');
@@ -612,8 +621,8 @@ async def get_dashboard():
                         </div>
 
                         <div class="grid grid-cols-2 gap-2">
-                            <button onclick="openOrderModal('${ex}', 'BUY')" class="bg-emerald-600/20 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">BUY</button>
-                            <button onclick="openOrderModal('${ex}', 'SELL')" class="bg-rose-600/20 hover:bg-rose-600 text-rose-400 hover:text-white border border-rose-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">SELL</button>
+                            <button onclick="openOrderModal('${ex}', 'BUY')" class="bg-emerald-600/20 hover:bg-emerald-600 text-emerald-400 hover:text-white border border-emerald-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">BUY / LONG</button>
+                            <button onclick="openOrderModal('${ex}', 'SELL')" class="bg-rose-600/20 hover:bg-rose-600 text-rose-400 hover:text-white border border-rose-500/30 py-2 rounded-lg font-semibold text-sm transition cursor-pointer">SELL / SHORT</button>
                         </div>
                     </div>
                 `;
@@ -724,7 +733,7 @@ async def get_dashboard():
 
             const tbody = document.getElementById('order-history-body');
             const now = new Date().toLocaleTimeString();
-            const pDecimals = data.symbol.includes('VELO') ? 4 : 2;
+            const pDecimals = (data.symbol.includes('VELO') || data.symbol.includes('SOXL')) ? 4 : 2;
             
             const row = document.createElement('tr');
             row.className = isSuccess ? "bg-emerald-950/20" : "bg-rose-950/20";
@@ -751,7 +760,7 @@ async def get_dashboard():
                 let asksHTML = '';
                 const sortedAsks = [...item.asks].reverse();
                 sortedAsks.forEach(ask => {
-                    const pDecimals = item.symbol.includes('VELO') ? 4 : 2;
+                    const pDecimals = (item.symbol.includes('VELO') || item.symbol.includes('SOXL')) ? 4 : 2;
                     asksHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-rose-400">${Number(ask[0]).toFixed(pDecimals)}</span><span class="text-slate-400">${Number(ask[1]).toFixed(2)}</span></div>`;
                 });
                 document.getElementById(`${ex}-asks`).innerHTML = asksHTML;
@@ -762,7 +771,7 @@ async def get_dashboard():
             if (item.bids && item.bids.length > 0) {
                 let bidsHTML = '';
                 item.bids.forEach(bid => {
-                    const pDecimals = item.symbol.includes('VELO') ? 4 : 2;
+                    const pDecimals = (item.symbol.includes('VELO') || item.symbol.includes('SOXL')) ? 4 : 2;
                     bidsHTML += `<div class="flex justify-between text-xs font-mono px-1 py-0.5 rounded"><span class="text-emerald-400">${Number(bid[0]).toFixed(pDecimals)}</span><span class="text-slate-400">${Number(bid[1]).toFixed(2)}</span></div>`;
                 });
                 document.getElementById(`${ex}-bids`).innerHTML = bidsHTML;
@@ -772,7 +781,7 @@ async def get_dashboard():
 
             if(item.asks && item.asks.length > 0 && item.bids && item.bids.length > 0) {
                 const spread = item.asks[0][0] - item.bids[0][0];
-                const pDecimals = item.symbol.includes('VELO') ? 4 : 2;
+                const pDecimals = (item.symbol.includes('VELO') || item.symbol.includes('SOXL')) ? 4 : 2;
                 document.getElementById(`${ex}-spread`).innerText = spread.toFixed(pDecimals);
             }
 
@@ -788,7 +797,7 @@ async def get_dashboard():
 
                     for (const [asset, data] of Object.entries(item.all_assets)) {
                         const percentage = exTotalUsdt > 0 ? (data.usdt_value / exTotalUsdt) * 100 : 0;
-                        const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
+                        const dec = (asset === 'VELO' || asset === 'SOXL') ? 2 : (data.amount < 1 ? 4 : 2);
                         assetsHTML += `
                             <div class="flex justify-between items-center text-[11px] py-0.5 border-b border-slate-800/40">
                                 <span class="text-slate-300 font-semibold">${asset}:</span>
@@ -854,7 +863,7 @@ async def get_dashboard():
                     let htmlList = '';
                     for (const [asset, data] of Object.entries(aggregatedAssets)) {
                         const percentage = grandTotalUsdt > 0 ? (data.usdt_value / grandTotalUsdt) * 100 : 0;
-                        const dec = asset === 'VELO' ? 2 : (data.amount < 1 ? 4 : 2);
+                        const dec = (asset === 'VELO' || asset === 'SOXL') ? 2 : (data.amount < 1 ? 4 : 2);
                         htmlList += `
                             <div class="flex justify-between items-center bg-slate-900/60 px-2 py-1 rounded">
                                 <span class="font-bold text-cyan-300">${asset}:</span>
@@ -914,7 +923,7 @@ async def get_dashboard():
                 selectedPrice = parseFloat(refPrice);
             }
 
-            const pDecimals = currentItem.symbol.includes('VELO') ? 4 : 2;
+            const pDecimals = (currentItem.symbol.includes('VELO') || currentItem.symbol.includes('SOXL')) ? 4 : 2;
 
             document.getElementById('modal-exchange').innerText = exchange.toUpperCase();
             document.getElementById('modal-symbol').innerText = currentItem.symbol;
